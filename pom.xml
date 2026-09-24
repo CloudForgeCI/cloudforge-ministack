@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Parent is cfc-core's root/BOM pom, resolved from a Maven repository (Central or the local
+       .m2 cache), not from a filesystem checkout: this module is not part of cfc-core's reactor.
+       The empty <relativePath/> is required; it disables Maven's default lookup of ../pom.xml,
+       so the build does not depend on where this checkout sits. -->
+  <parent>
+    <groupId>com.cloudforgeci</groupId>
+    <artifactId>cfc-core</artifactId>
+    <!-- Tracks cfc-core's latest published SNAPSHOT — kept current by sync-versions.yml. -->
+    <version>3.2.18-SNAPSHOT</version>
+    <relativePath/>
+  </parent>
+
+  <artifactId>cloudforge-ministack</artifactId>
+  <!-- Kept in lockstep with the parent's version (unlike e.g. cloudforge-manager-deployment,
+       which has its own independent release cadence): this module was a reactor member of
+       cfc-core until it moved to its own repository, and stays released alongside it on the same
+       version number, just via a <parent> reference instead of reactor membership. -->
+  <version>3.2.18-SNAPSHOT</version>
+  <packaging>jar</packaging>
+  <name>CloudForge MiniStack</name>
+  <description>MiniStack local deployment adapter, deployer, and pipeline for CloudForge templates</description>
+
+  <!-- Overrides the parent's <url>/<scm>, which point at CloudForgeCI/cfc-core. <licenses>/
+       <developers> are shared across CloudForgeCI modules and stay inherited. -->
+  <url>https://github.com/CloudForgeCI/cloudforge-ministack</url>
+
+  <scm>
+    <connection>scm:git:https://github.com/CloudForgeCI/cloudforge-ministack.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/CloudForgeCI/cloudforge-ministack.git</developerConnection>
+    <url>https://github.com/CloudForgeCI/cloudforge-ministack</url>
+  </scm>
+
+  <properties>
+    <aws.sdk.version>2.25.0</aws.sdk.version>
+    <testcontainers.version>1.21.0</testcontainers.version>
+  </properties>
+
+  <!-- Maven doesn't check the Central Portal's snapshots URL by default — needed to resolve the
+       parent POM above while cfc-core is on a -SNAPSHOT version. Release (non-SNAPSHOT) builds
+       never use this repository. -->
+  <repositories>
+    <repository>
+      <id>central-snapshots</id>
+      <url>https://central.sonatype.com/repository/maven-snapshots/</url>
+      <releases><enabled>false</enabled></releases>
+      <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.cloudforgeci</groupId>
+      <artifactId>cloudforge-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>cloudformation</artifactId>
+      <version>${aws.sdk.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <version>${testcontainers.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>ec2</artifactId>
+      <version>${aws.sdk.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>elasticloadbalancingv2</artifactId>
+      <version>${aws.sdk.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>route53</artifactId>
+      <version>${aws.sdk.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>acm</artifactId>
+      <version>${aws.sdk.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <artifactId>maven-compiler-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <excludedGroups>ministack</excludedGroups>
+        </configuration>
+      </plugin>
+      <!-- Coverage check deferred until deployer/runtime tests expand -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>check</id>
+            <phase>none</phase>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <profile>
+      <id>ministack</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration combine.self="override">
+              <!-- Run full module test suite (unit + @Tag("ministack") integration) -->
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

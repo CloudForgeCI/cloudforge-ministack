@@ -1,0 +1,1 @@
+{"stackName":"SonarQube-Stack","applicationId":"sonarqube","applicationName":"SonarQube","environment":"development","runtime":"FARGATE","authMode":"none"}
