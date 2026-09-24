@@ -138,6 +138,26 @@ class MiniStackDeployPreflightTest {
             java.io.IOException.class,
             () -> result.throwIfBlocked(PreflightMode.ENFORCE));
         assertTrue(blocked.getMessage().contains("RDS"));
-        assertTrue(blocked.getMessage().contains("option 8"));
+        assertTrue(blocked.getMessage().contains("cloudforge-cli"));
+    }
+
+    @Test
+    void blocksTemplateReferencingTheLocalEmulatorZoneMarker() throws Exception {
+        // CloudForgeSynthesizer#seedHostedZoneContext seeds this placeholder for any local-emulator
+        // deploy (LocalStack or MiniStack, indistinguishable by account alone) with an existing
+        // domain and createZone: false. Safe for LocalStack, which strips Route53 RecordSets before
+        // deploy; MiniStack does not, so a template still referencing it must be blocked here.
+        ObjectNode template = MAPPER.createObjectNode();
+        template.putObject("Resources")
+            .putObject("DnsRecord")
+            .putObject("Properties")
+            .put("HostedZoneId", "/hostedzone/LOCALEMULATORZONE");
+        Path canonical = tempDir.resolve("with-domain.json");
+        Files.writeString(canonical, MAPPER.writeValueAsString(template));
+
+        PreflightResult result = MiniStackDeployPreflight.validate(new DeploymentConfig(), null, canonical);
+
+        assertFalse(result.allowed(PreflightMode.ENFORCE));
+        assertEquals("UNRESOLVABLE_HOSTED_ZONE", result.blockingViolations().getFirst().ruleId());
     }
 }

@@ -26,9 +26,18 @@ import java.util.stream.Collectors;
 public final class MiniStackDeployPreflight {
 
     private static final String RDS_SUGGESTION =
-        "Use Interactive Deployer option 8 (LocalStack) for RDS-backed apps, "
+        "Use `cloudforge-cli deploy --target localstack` for RDS-backed apps, "
             + "or deploy a MiniStack-friendly app (jenkins, cloudforge-manager, drone, gitea, "
             + "prometheus, grafana, metabase, vault, redis) with authMode: none.";
+
+    // The dummy hosted-zone id CloudForgeSynthesizer#seedHostedZoneContext seeds for any deploy
+    // using the shared local-emulator account (000000000000, the convention both LocalStack and
+    // MiniStack use) -- safe for LocalStack, whose LocalStackTemplateAdapter strips every
+    // AWS::Route53::RecordSet before deploy, but MiniStack does no such stripping, so a canonical
+    // template referencing this marker would deploy a RecordSet pointed at a hosted zone that
+    // doesn't exist. Synthesis can't tell the two targets apart from the account alone; this
+    // preflight check catches the result instead.
+    private static final String LOCAL_EMULATOR_ZONE_MARKER = "LOCALEMULATORZONE";
 
     private MiniStackDeployPreflight() {
     }
@@ -103,20 +112,30 @@ public final class MiniStackDeployPreflight {
     private static void validateTemplate(JsonNode template, List<PreflightViolation> violations) {
         List<MiniStackCfnResourceCatalog.TemplateResourceRef> unsupported =
             MiniStackCfnResourceCatalog.unsupportedResources(template);
-        if (unsupported.isEmpty()) {
-            return;
+        if (!unsupported.isEmpty()) {
+            String resourceList = unsupported.stream()
+                .limit(8)
+                .map(MiniStackCfnResourceCatalog.TemplateResourceRef::toString)
+                .collect(Collectors.joining(", "));
+            if (unsupported.size() > 8) {
+                resourceList += " (+" + (unsupported.size() - 8) + " more)";
+            }
+            violations.add(new PreflightViolation(
+                PreflightSeverity.BLOCK,
+                "UNSUPPORTED_CFN_TYPES",
+                "Canonical template contains MiniStack-unsupported resources: " + resourceList,
+                RDS_SUGGESTION));
         }
-        String resourceList = unsupported.stream()
-            .limit(8)
-            .map(MiniStackCfnResourceCatalog.TemplateResourceRef::toString)
-            .collect(Collectors.joining(", "));
-        if (unsupported.size() > 8) {
-            resourceList += " (+" + (unsupported.size() - 8) + " more)";
+
+        if (template.toString().contains(LOCAL_EMULATOR_ZONE_MARKER)) {
+            violations.add(new PreflightViolation(
+                PreflightSeverity.BLOCK,
+                "UNRESOLVABLE_HOSTED_ZONE",
+                "Canonical template references a placeholder Route53 hosted zone "
+                    + "(" + LOCAL_EMULATOR_ZONE_MARKER + ") that doesn't exist on MiniStack.",
+                "This combination (a custom domain with createZone: false) isn't supported on "
+                    + "MiniStack -- either set createZone to true so a real zone is created, or "
+                    + "drop the domain and deploy without one."));
         }
-        violations.add(new PreflightViolation(
-            PreflightSeverity.BLOCK,
-            "UNSUPPORTED_CFN_TYPES",
-            "Canonical template contains MiniStack-unsupported resources: " + resourceList,
-            RDS_SUGGESTION));
     }
 }
