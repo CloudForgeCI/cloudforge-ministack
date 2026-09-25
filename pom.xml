@@ -11,7 +11,7 @@
     <groupId>com.cloudforgeci</groupId>
     <artifactId>cfc-core</artifactId>
     <!-- Tracks cfc-core's latest published SNAPSHOT — kept current by sync-versions.yml. -->
-    <version>3.2.18-SNAPSHOT</version>
+    <version>3.2.20-SNAPSHOT</version>
     <relativePath/>
   </parent>
 
@@ -20,7 +20,7 @@
        which has its own independent release cadence): this module was a reactor member of
        cfc-core until it moved to its own repository, and stays released alongside it on the same
        version number, just via a <parent> reference instead of reactor membership. -->
-  <version>3.2.18-SNAPSHOT</version>
+  <version>3.2.20-SNAPSHOT</version>
   <packaging>jar</packaging>
   <name>CloudForge MiniStack</name>
   <description>MiniStack local deployment adapter, deployer, and pipeline for CloudForge templates</description>

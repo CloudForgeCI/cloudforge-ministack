@@ -1,0 +1,117 @@
+name: Publish to Maven Central
+
+# Builds, tests, and publishes this module -- SNAPSHOT or real release, whatever version the pom
+# currently carries. Version is never bumped here; sync-cfc-core-version.yml keeps it in lockstep
+# with cfc-core's own version, so a push here just publishes whatever that workflow last set.
+#
+# Required repo secrets (same four cfc-core's own publish workflows use):
+#   GPG_PRIVATE_KEY, GPG_PASSPHRASE, CENTRAL_PORTAL_USERNAME, CENTRAL_PORTAL_PASSWORD
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build and test
+        run: mvn -B clean verify
+
+  publish:
+    name: Sign and publish to Central
+    # macOS, not Linux: on GitHub's Linux runners gpg-agent fails with "Too much data for IPC
+    # layer" when signing -- same issue cfc-core's own publish workflows document. macOS runners
+    # are not affected.
+    runs-on: macos-latest
+    needs: build-test
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Install gnupg
+        run: brew install gnupg
+
+      - name: Read project version
+        id: version
+        run: |
+          VERSION=$(mvn -q -pl . help:evaluate -Dexpression=project.version -DforceStdout)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Project version: $VERSION"
+
+      - name: Import GPG signing key
+        env:
+          GPG_PRIVATE_KEY_B64: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
+          DECODED=$(echo "$GPG_PRIVATE_KEY_B64" | base64 -d)
+          while IFS= read -r line; do
+            [ -n "$line" ] && echo "::add-mask::$line"
+          done <<< "$DECODED"
+          echo "$DECODED" | gpg --batch --import
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "GPG_HOMEDIR=$GNUPGHOME" >> "$GITHUB_ENV"
+
+      - name: Configure Maven settings.xml (Central Portal credentials)
+        env:
+          CENTRAL_PORTAL_USERNAME: ${{ secrets.CENTRAL_PORTAL_USERNAME }}
+          CENTRAL_PORTAL_PASSWORD: ${{ secrets.CENTRAL_PORTAL_PASSWORD }}
+        run: |
+          if [ -z "$CENTRAL_PORTAL_USERNAME" ] || [ -z "$CENTRAL_PORTAL_PASSWORD" ]; then
+            echo "::error::CENTRAL_PORTAL_USERNAME/CENTRAL_PORTAL_PASSWORD secrets are not set."
+            exit 1
+          fi
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << EOF
+          <settings>
+            <servers>
+              <server>
+                <id>central</id>
+                <username>${CENTRAL_PORTAL_USERNAME}</username>
+                <password>${CENTRAL_PORTAL_PASSWORD}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      - name: Build, sign, and publish
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: mvn -B -Prelease clean deploy -DskipTests "-Dgpg.passphrase=$MAVEN_GPG_PASSPHRASE"
+
+      - name: Clean up credentials
+        if: always()
+        run: |
+          rm -f ~/.m2/settings.xml
+          rm -rf "${GNUPGHOME:-$RUNNER_TEMP/gnupg}"
+
+      - name: Publish summary
+        if: always()
+        run: |
+          echo "## Maven Central Publish" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
