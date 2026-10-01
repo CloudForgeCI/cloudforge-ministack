@@ -1,0 +1,41 @@
+# BEGIN CloudForge local emulator (*.localhost)
+# Shared by MiniStack and LocalStack — both publish ECS tasks on 127.0.0.1.
+# Docs: docs/guides/LOCAL_EMULATOR_HOSTS.md
+# Setup: ./scripts/setup-cloudforge-local-hosts.sh
+#
+# Always include the scheme (browsers may treat a bare name as a search):
+#   open http://nginx.cloudforge.localhost/
+#   open http://localstack.cloudforge.localhost/
+#   open http://stackport.cloudforge.localhost/
+#
+# The nginx edge routes only *.cloudforge.localhost names. The short *.localhost names
+# below reach an application only with an explicit port (for example jenkins.localhost:8080).
+
+# Platform (short names)
+127.0.0.1 localstack.localhost
+127.0.0.1 ministack.localhost
+127.0.0.1 emulator.localhost
+127.0.0.1 stackport.localhost
+127.0.0.1 nginx.localhost
+
+# Apps
+127.0.0.1 manager.localhost
+127.0.0.1 jenkins.localhost
+127.0.0.1 grafana.localhost
+127.0.0.1 prometheus.localhost
+127.0.0.1 vault.localhost
+127.0.0.1 nexus.localhost
+127.0.0.1 sonarqube.localhost
+127.0.0.1 redis.localhost
+127.0.0.1 postgres.localhost
+127.0.0.1 drone.localhost
+127.0.0.1 gitea.localhost
+127.0.0.1 metabase.localhost
+
+# Canonical *.cloudforge.localhost names (routed by the nginx edge)
+127.0.0.1 localstack.cloudforge.localhost ministack.cloudforge.localhost emulator.cloudforge.localhost
+127.0.0.1 stackport.cloudforge.localhost nginx.cloudforge.localhost manager.cloudforge.localhost
+127.0.0.1 jenkins.cloudforge.localhost grafana.cloudforge.localhost prometheus.cloudforge.localhost
+127.0.0.1 vault.cloudforge.localhost nexus.cloudforge.localhost sonarqube.cloudforge.localhost
+
+# END CloudForge local emulator (*.localhost)
