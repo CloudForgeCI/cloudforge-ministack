@@ -35,6 +35,11 @@ curl -s http://localhost:4566/_localstack/health
 curl -s http://localhost:4566/_ministack/health
 ```
 
+## Bootstrap (MiniStack)
+
+Deploys require a CDK bootstrap in each region, as on AWS. The deploy prints the exact command when
+it is missing; see the [README](../../README.md#2-bootstrap-the-emulator).
+
 ## Deploy an application
 
 ```bash
@@ -61,9 +66,8 @@ CloudForge Manager is provided by the `cloudforge-manager-deployment` artifact, 
 3. reconciles the emulator edge; and
 4. waits for `http://manager.cloudforge.localhost/api/v1/health`.
 
-Contexts that set `provisionDatabase: true` (for example `CloudForgeManager-Dev.json`) deploy
-to LocalStack only; MiniStack preflight blocks RDS. After deployment, open
-`http://manager.cloudforge.localhost/`.
+Contexts that set `provisionDatabase: true` also deploy to MiniStack: the database is started as a
+real container through the RDS API. After deployment, open `http://manager.cloudforge.localhost/`.
 
 CloudForge Manager itself is developed in a separate repository.
 
