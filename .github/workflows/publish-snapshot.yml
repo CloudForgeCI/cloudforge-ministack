@@ -93,6 +93,12 @@ jobs:
                 <id>central</id>
                 <username>${CENTRAL_PORTAL_USERNAME}</username>
                 <password>${CENTRAL_PORTAL_PASSWORD}</password>
+                <!-- Maven sends a server's credentials only to the origins of the repositories declared
+                     with the same id, and "central" is Maven Central. List the Central Portal origin so
+                     the credentials go to the snapshots repository and not to Maven Central. -->
+                <repositoryOrigins>
+                  <repositoryOrigin>https://central.sonatype.com</repositoryOrigin>
+                </repositoryOrigins>
               </server>
             </servers>
           </settings>
