@@ -6,7 +6,10 @@ import com.cloudforge.core.local.LocalDeployer;
 import com.cloudforge.core.local.LocalDeploymentCatalog;
 import com.cloudforge.core.local.LocalResourceChange;
 import com.cloudforge.core.local.LocalSameApplicationStackReplacer;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.nio.charset.StandardCharsets;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -28,6 +31,8 @@ import software.amazon.awssdk.services.cloudformation.model.Output;
 import software.amazon.awssdk.services.cloudformation.model.ResourceChange;
 import software.amazon.awssdk.services.cloudformation.model.StackSummary;
 import software.amazon.awssdk.services.cloudformation.model.Tag;
+import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.ssm.model.ParameterNotFoundException;
 
 import java.io.IOException;
 import java.net.URI;
@@ -55,6 +60,9 @@ public final class MiniStackDeployer implements LocalDeployer {
     private static final Duration POLL_INTERVAL = Duration.ofMillis(500);
 
     private final CloudFormationClient cloudFormation;
+    private final SsmClient ssm;
+    private final String endpoint;
+    private final String region;
 
     public MiniStackDeployer() {
         this(
@@ -77,18 +85,90 @@ public final class MiniStackDeployer implements LocalDeployer {
 
     /** Visible for tests and custom endpoint wiring. */
     public MiniStackDeployer(String endpoint, String region) {
+        this.endpoint = endpoint;
+        this.region = region;
+        var credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
         cloudFormation = CloudFormationClient.builder()
             .endpointOverride(URI.create(endpoint))
             .region(Region.of(region))
-            .credentialsProvider(StaticCredentialsProvider.create(
-                AwsBasicCredentials.create("test", "test")))
+            .credentialsProvider(credentials)
             .build();
+        ssm = SsmClient.builder()
+            .endpointOverride(URI.create(endpoint))
+            .region(Region.of(region))
+            .credentialsProvider(credentials)
+            .build();
+    }
+
+    /** CloudFormation rejects an inline template body over this many bytes; larger ones need S3. */
+    static final int MAX_INLINE_TEMPLATE_BYTES = 51_200;
+
+    /**
+     * The template without the whitespace CDK pretty-prints it with, which is more than half its size.
+     * Fails with an explanation when it is still too large to send inline.
+     */
+    static String compact(String templateBody) throws IOException {
+        String compact = MAPPER.writeValueAsString(MAPPER.readTree(templateBody));
+        int bytes = compact.getBytes(StandardCharsets.UTF_8).length;
+        if (bytes > MAX_INLINE_TEMPLATE_BYTES) {
+            throw new IOException("The template is " + bytes + " bytes, over the " + MAX_INLINE_TEMPLATE_BYTES
+                + "-byte limit CloudFormation accepts inline. Real AWS needs it uploaded to S3 as well.");
+        }
+        return compact;
+    }
+
+    /**
+     * Creates the databases the template asks for and returns the template rewritten to use them,
+     * with generated secrets given local values.
+     */
+    private String provisionDatabases(String templateBody, List<String> createdDatabases) throws IOException {
+        var template = (ObjectNode) MAPPER.readTree(templateBody);
+        var plans = MiniStackDatabases.plan(template);
+        if (plans.isEmpty()) {
+            return MAPPER.writeValueAsString(MiniStackDatabases.inlineGeneratedSecrets(template));
+        }
+        try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region)) {
+            var endpoints = provisioner.provision(plans);
+            createdDatabases.addAll(provisioner.createdIdentifiers());
+            return MAPPER.writeValueAsString(MiniStackDatabases.inlineGeneratedSecrets(
+                MiniStackDatabases.rewrite(template, plans, endpoints)));
+        }
+    }
+
+    private void requireCdkBootstrap(String templateBody) throws IOException {
+        var parameter = MiniStackCdkBootstrap.requiredParameter(templateBody);
+        if (parameter.isEmpty()) {
+            return;
+        }
+        try {
+            ssm.getParameter(r -> r.name(parameter.get()));
+        } catch (ParameterNotFoundException e) {
+            throw new IOException(MiniStackCdkBootstrap.instructions(endpoint, region, parameter.get()), e);
+        }
     }
 
     @Override
     public LocalDeployResult deploy(String stackName, Path template) throws IOException {
         boolean exists = stackExists(stackName);
         String templateBody = Files.readString(template);
+        requireCdkBootstrap(templateBody);
+        List<String> createdDatabases = new ArrayList<>();
+        templateBody = compact(provisionDatabases(templateBody, createdDatabases));
+        try {
+            return deployStack(stackName, templateBody, exists);
+        } catch (IOException | RuntimeException e) {
+            // A first deploy that fails leaves no stack, so a later destroy cannot find the databases it
+            // created. Remove them here.
+            if (!exists && !createdDatabases.isEmpty()) {
+                try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region)) {
+                    provisioner.delete(createdDatabases);
+                }
+            }
+            throw e;
+        }
+    }
+
+    private LocalDeployResult deployStack(String stackName, String templateBody, boolean exists) throws IOException {
         if (exists && templateMatches(stackName, templateBody)) {
             return new LocalDeployResult(stackName, false, true, List.of(), outputs(stackName));
         }
@@ -134,7 +214,19 @@ public final class MiniStackDeployer implements LocalDeployer {
             );
         }
 
+        createCognitoUsers(stackName, templateBody);
         return new LocalDeployResult(stackName, !exists, false, changes, outputs(stackName));
+    }
+
+    /** Creates the Cognito users the template declared, which MiniStack's CloudFormation cannot. */
+    private void createCognitoUsers(String stackName, String templateBody) throws IOException {
+        JsonNode recorded = MAPPER.readTree(templateBody).path("Metadata").path(MiniStackCognitoUsers.METADATA_KEY);
+        if (recorded.isMissingNode()) {
+            return;
+        }
+        MiniStackCognitoUsers.create(recorded, endpoint, region, logicalId -> cloudFormation
+            .describeStackResource(r -> r.stackName(stackName).logicalResourceId(logicalId))
+            .stackResourceDetail().physicalResourceId());
     }
 
     @Override
@@ -142,12 +234,18 @@ public final class MiniStackDeployer implements LocalDeployer {
         if (!stackExists(stackName)) {
             return;
         }
+        List<String> databases = deployedDatabases(stackName);
         try {
             cloudFormation.deleteStack(DeleteStackRequest.builder().stackName(stackName).build());
             cloudFormation.waiter().waitUntilStackDeleteComplete(
                 DescribeStacksRequest.builder().stackName(stackName).build());
         } catch (Exception e) {
             throw new IOException("Failed to delete MiniStack stack " + stackName, e);
+        }
+        if (!databases.isEmpty()) {
+            try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region)) {
+                provisioner.delete(databases);
+            }
         }
     }
 
@@ -291,6 +389,17 @@ public final class MiniStackDeployer implements LocalDeployer {
             .build());
     }
 
+    /** The databases created for the stack, recorded in its deployed template. */
+    private List<String> deployedDatabases(String stackName) {
+        try {
+            String deployed = cloudFormation.getTemplate(
+                GetTemplateRequest.builder().stackName(stackName).build()).templateBody();
+            return MiniStackDatabases.provisionedIdentifiers(MAPPER.readTree(deployed));
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
     private boolean templateMatches(String stackName, String candidate) throws IOException {
         try {
             String deployed = cloudFormation.getTemplate(
@@ -357,6 +466,7 @@ public final class MiniStackDeployer implements LocalDeployer {
     @Override
     public void close() {
         cloudFormation.close();
+        ssm.close();
     }
 
     /** @deprecated use {@link LocalResourceChange}. */
