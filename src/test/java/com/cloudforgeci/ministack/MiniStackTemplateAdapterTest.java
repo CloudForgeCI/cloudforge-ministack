@@ -4,6 +4,8 @@ import com.cloudforge.core.local.TemplateAdaptationResult;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.util.HashMap;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -171,5 +173,237 @@ class MiniStackTemplateAdapterTest {
               }
             }
             """.formatted(actions));
+    }
+
+    @Test
+    void removesLogRetentionCustomResourcesAndTheirUnusedProvider() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {
+              "Resources": {
+                "Db": {"Type": "AWS::RDS::DBInstance", "Properties": {"Engine": "mysql"}},
+                "DbLogRetentionError": {
+                  "Type": "Custom::LogRetention",
+                  "Properties": {
+                    "LogGroupName": {"Fn::Join": ["", ["/aws/rds/instance/", {"Ref": "Db"}, "/error"]]},
+                    "ServiceToken": {"Fn::GetAtt": ["LogRetentionabc123", "Arn"]}
+                  }
+                },
+                "LogRetentionabc123": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {"Role": {"Fn::GetAtt": ["LogRetentionabc123ServiceRole", "Arn"]}},
+                  "DependsOn": ["LogRetentionabc123ServiceRoleDefaultPolicy"]
+                },
+                "LogRetentionabc123ServiceRole": {"Type": "AWS::IAM::Role", "Properties": {}},
+                "LogRetentionabc123ServiceRoleDefaultPolicy": {
+                  "Type": "AWS::IAM::Policy",
+                  "Properties": {"Roles": [{"Ref": "LogRetentionabc123ServiceRole"}]}
+                }
+              }
+            }
+            """);
+
+        TemplateAdaptationResult result =
+            MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "db-mini");
+
+        JsonNode resources = result.template().path("Resources");
+        assertTrue(resources.has("Db"), "the database itself stays");
+        assertFalse(resources.has("DbLogRetentionError"));
+        assertFalse(resources.has("LogRetentionabc123"));
+        assertFalse(resources.has("LogRetentionabc123ServiceRole"));
+        assertFalse(resources.has("LogRetentionabc123ServiceRoleDefaultPolicy"));
+        assertEquals(4, result.adaptations().size());
+    }
+
+    @Test
+    void keepsALogRetentionNamedFunctionThatOtherResourcesStillUse() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {
+              "Resources": {
+                "DbLogRetentionError": {
+                  "Type": "Custom::LogRetention",
+                  "Properties": {"ServiceToken": {"Fn::GetAtt": ["LogRetentionabc123", "Arn"]}}
+                },
+                "LogRetentionabc123": {"Type": "AWS::Lambda::Function", "Properties": {}},
+                "Other": {
+                  "Type": "Custom::Something",
+                  "Properties": {"ServiceToken": {"Fn::GetAtt": ["LogRetentionabc123", "Arn"]}}
+                }
+              }
+            }
+            """);
+
+        JsonNode resources = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "db-mini").template().path("Resources");
+
+        assertFalse(resources.has("DbLogRetentionError"));
+        assertTrue(resources.has("LogRetentionabc123"), "still referenced, so it stays");
+        assertTrue(resources.has("Other"));
+    }
+
+    @Test
+    void replacesThePrivateCertificateChainWithPlainHttpForwarding() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {
+              "Resources": {
+                "PrivateCA": {"Type": "AWS::ACMPCA::CertificateAuthority", "Properties": {}},
+                "RootCert": {"Type": "AWS::ACMPCA::Certificate", "Properties": {}},
+                "CaActivation": {"Type": "AWS::ACMPCA::CertificateAuthorityActivation", "Properties": {}},
+                "CaPermission": {"Type": "AWS::ACMPCA::Permission", "Properties": {}},
+                "HttpsCert": {
+                  "Type": "AWS::CertificateManager::Certificate",
+                  "Properties": {"CertificateAuthorityArn": {"Ref": "PrivateCA"}},
+                  "DependsOn": ["CaPermission"]
+                },
+                "HttpListener": {
+                  "Type": "AWS::ElasticLoadBalancingV2::Listener",
+                  "Properties": {"Port": 80, "Protocol": "HTTP", "DefaultActions": [
+                    {"Type": "redirect", "RedirectConfig": {"Port": "443", "Protocol": "HTTPS", "StatusCode": "HTTP_301"}}]}
+                },
+                "HttpsListener": {
+                  "Type": "AWS::ElasticLoadBalancingV2::Listener",
+                  "Properties": {"Port": 443, "Protocol": "HTTPS",
+                    "Certificates": [{"CertificateArn": {"Ref": "HttpsCert"}}],
+                    "DefaultActions": [{"Type": "forward", "TargetGroupArn": {"Ref": "AppTargets"}}]}
+                },
+                "AppTargets": {"Type": "AWS::ElasticLoadBalancingV2::TargetGroup", "Properties": {}},
+                "Service": {"Type": "AWS::ECS::Service", "DependsOn": ["HttpsListener", "AppTargets"], "Properties": {}}
+              }
+            }
+            """);
+
+        JsonNode resources = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "oidc-mini").template().path("Resources");
+
+        for (String gone : new String[] {"PrivateCA", "RootCert", "CaActivation", "CaPermission", "HttpsCert", "HttpsListener"}) {
+            assertFalse(resources.has(gone), gone);
+        }
+        JsonNode action = resources.path("HttpListener").path("Properties").path("DefaultActions").get(0);
+        assertEquals("forward", action.path("Type").asText());
+        assertEquals("AppTargets", action.path("TargetGroupArn").path("Ref").asText());
+        assertTrue(resources.has("AppTargets"));
+        assertEquals(1, resources.path("Service").path("DependsOn").size(), "the removed listener is no longer a dependency");
+        assertEquals("AppTargets", resources.path("Service").path("DependsOn").get(0).asText());
+    }
+
+    @Test
+    void leavesAnHttpsListenerWithAnImportedCertificateAlone() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {
+              "Resources": {
+                "Cert": {"Type": "AWS::CertificateManager::Certificate", "Properties": {"DomainName": "app.example.com"}},
+                "HttpsListener": {
+                  "Type": "AWS::ElasticLoadBalancingV2::Listener",
+                  "Properties": {"Port": 443, "Protocol": "HTTPS",
+                    "Certificates": [{"CertificateArn": {"Ref": "Cert"}}],
+                    "DefaultActions": [{"Type": "forward", "TargetGroupArn": "tg"}]}
+                }
+              }
+            }
+            """);
+
+        JsonNode resources = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "domain-mini").template().path("Resources");
+
+        assertTrue(resources.has("Cert"));
+        assertTrue(resources.has("HttpsListener"));
+    }
+
+    @Test
+    void movesCognitoUsersAndMembershipsToMetadataAndDropsBranding() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {
+              "Resources": {
+                "Pool": {"Type": "AWS::Cognito::UserPool", "Properties": {}},
+                "Admins": {"Type": "AWS::Cognito::UserPoolGroup",
+                  "Properties": {"GroupName": "Admins", "UserPoolId": {"Ref": "Pool"}}},
+                "AdminUser": {"Type": "AWS::Cognito::UserPoolUser", "Properties": {
+                  "UserPoolId": {"Ref": "Pool"}, "Username": "admin@example.invalid",
+                  "UserAttributes": [{"Name": "email", "Value": "admin@example.invalid"},
+                                     {"Name": "email_verified", "Value": "true"}]}},
+                "AdminMember": {"Type": "AWS::Cognito::UserPoolUserToGroupAttachment",
+                  "DependsOn": ["Admins", "AdminUser"],
+                  "Properties": {"UserPoolId": {"Ref": "Pool"}, "Username": "admin@example.invalid", "GroupName": "Admins"}},
+                "Branding": {"Type": "AWS::Cognito::ManagedLoginBranding", "Properties": {"UserPoolId": {"Ref": "Pool"}}},
+                "Service": {"Type": "AWS::ECS::Service", "DependsOn": ["AdminMember"], "Properties": {}}
+              }
+            }
+            """);
+
+        JsonNode template = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "cog-mini").template();
+        JsonNode resources = template.path("Resources");
+
+        assertTrue(resources.has("Pool"));
+        assertTrue(resources.has("Admins"), "groups are created by MiniStack's CloudFormation");
+        assertFalse(resources.has("AdminUser"));
+        assertFalse(resources.has("AdminMember"));
+        assertFalse(resources.has("Branding"));
+        assertFalse(resources.path("Service").has("DependsOn"), "no dependency on a removed resource");
+
+        JsonNode recorded = template.path("Metadata").path(MiniStackCognitoUsers.METADATA_KEY);
+        assertEquals("Pool", recorded.path("users").get(0).path("pool").asText());
+        assertEquals("admin@example.invalid", recorded.path("users").get(0).path("username").asText());
+        assertEquals("true", recorded.path("users").get(0).path("attributes").path("email_verified").asText());
+        assertEquals("Admins", recorded.path("memberships").get(0).path("group").asText());
+    }
+
+    @Test
+    void addsNoCognitoMetadataWhenTheTemplateHasNoUsers() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree(
+            "{\"Resources\":{\"Pool\":{\"Type\":\"AWS::Cognito::UserPool\",\"Properties\":{}}}}");
+
+        JsonNode template = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "cog-mini").template();
+
+        assertFalse(template.path("Metadata").has(MiniStackCognitoUsers.METADATA_KEY));
+    }
+
+    @Test
+    void theLocalCognitoPasswordIsStableAndMeetsTheUsualPasswordPolicy() {
+        String password = MiniStackCognitoUsers.localPassword("Pool", "admin@example.invalid");
+
+        assertEquals(password, MiniStackCognitoUsers.localPassword("Pool", "admin@example.invalid"));
+        assertTrue(password.length() >= 12 && password.matches(".*[A-Z].*") && password.matches(".*[a-z].*")
+            && password.matches(".*\\d.*") && password.endsWith("!"), password);
+    }
+
+    @Test
+    void theLoadBalancerForwardsToEcsOnlyOnMiniStack15AndLater() {
+        assertFalse(MiniStackTemplateAdapter.albForwardsToEcs("ministackorg/ministack:1.4.9", null));
+        assertTrue(MiniStackTemplateAdapter.albForwardsToEcs("ministackorg/ministack:1.5.27", null));
+        assertTrue(MiniStackTemplateAdapter.albForwardsToEcs("ministackorg/ministack:2.0.0", null));
+        assertFalse(MiniStackTemplateAdapter.albForwardsToEcs("ministackorg/ministack:latest", null));
+        assertTrue(MiniStackTemplateAdapter.albForwardsToEcs("ministackorg/ministack:1.4.9", "true"),
+            "an emulator started by hand can say it forwards");
+        assertFalse(MiniStackTemplateAdapter.albForwardsToEcs("ministackorg/ministack:1.5.27", "false"));
+    }
+
+    @Test
+    void tellsTheManagerItRunsInALocalEmulatorSoSetupWorksThroughTheLoadBalancer() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {"Resources": {
+              "Task": {"Type": "AWS::ECS::TaskDefinition", "Properties": {"ContainerDefinitions": [
+                {"Name": "manager", "Image": "cloudforgeci/cloudforge-manager:native-latest",
+                 "Environment": [{"Name": "CFC_MANAGER_AUTH_MODE", "Value": "none"}]},
+                {"Name": "sidecar", "Image": "cloudforgeci/cloudforge-synth-service:latest", "Environment": []}]}},
+              "Other": {"Type": "AWS::ECS::TaskDefinition", "Properties": {"ContainerDefinitions": [
+                {"Name": "app", "Image": "gitea/gitea:latest", "Environment": []}]}}}}
+            """);
+
+        JsonNode resources = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "mgr-mini").template().path("Resources");
+
+        JsonNode manager = resources.path("Task").path("Properties").path("ContainerDefinitions").get(0);
+        Map<String, String> env = new HashMap<>();
+        manager.path("Environment").forEach(e -> env.put(e.path("Name").asText(), e.path("Value").asText()));
+        assertEquals("ministack", env.get("CFC_MANAGER_TARGET"));
+        assertEquals("http://cfc-ministack:4566", env.get("CFC_MANAGER_MINISTACK_ENDPOINT"));
+        assertEquals("none", env.get("CFC_MANAGER_AUTH_MODE"), "existing settings are kept");
+        assertEquals(0, resources.path("Task").path("Properties").path("ContainerDefinitions").get(1)
+            .path("Environment").size(), "the sidecar is not the Manager");
+        assertEquals(0, resources.path("Other").path("Properties").path("ContainerDefinitions").get(0)
+            .path("Environment").size(), "other applications are untouched");
+    }
+
+    @Test
+    void theEmulatorPublishesTheLegacyDatabasePortRangeOnlyBefore15() {
+        assertFalse(MiniStackTemplateAdapter.isVersion15OrLater("ministackorg/ministack:1.4.9"));
+        assertTrue(MiniStackTemplateAdapter.isVersion15OrLater("ministackorg/ministack:1.5.27"));
+        assertFalse(MiniStackTemplateAdapter.isVersion15OrLater("ministackorg/ministack:latest"));
+        assertFalse(MiniStackTemplateAdapter.isVersion15OrLater(null));
     }
 }

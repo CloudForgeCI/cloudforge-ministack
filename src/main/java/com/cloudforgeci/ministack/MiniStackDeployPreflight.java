@@ -5,6 +5,7 @@ import com.cloudforge.core.enums.TopologyType;
 import com.cloudforge.core.interfaces.ApplicationSpec;
 import com.cloudforge.core.local.DeploymentTarget;
 import com.cloudforge.core.local.LocalDeploymentNaming;
+import com.cloudforge.core.local.LocalEmulatorSpec;
 import com.cloudforge.core.local.LocalHostPortConflictChecker;
 import com.cloudforge.core.local.MiniStackCfnResourceCatalog;
 import com.cloudforge.core.local.PreflightResult;
@@ -25,10 +26,9 @@ import java.util.stream.Collectors;
  */
 public final class MiniStackDeployPreflight {
 
-    private static final String RDS_SUGGESTION =
-        "Use `cloudforge-cli deploy --target localstack` for RDS-backed apps, "
-            + "or deploy a MiniStack-friendly app (jenkins, cloudforge-manager, drone, gitea, "
-            + "prometheus, grafana, metabase, vault, redis) with authMode: none.";
+    private static final String UNSUPPORTED_SUGGESTION =
+        "Use `cloudforge-cli deploy --target localstack` or deploy to AWS, or remove the listed resources "
+            + "(RDS clusters such as Aurora, WAF, Config, CloudTrail, Backup and GuardDuty are not available on MiniStack).";
 
     // The dummy hosted-zone id CloudForgeSynthesizer#seedHostedZoneContext seeds for any deploy
     // using the shared local-emulator account (000000000000, the convention both LocalStack and
@@ -70,14 +70,26 @@ public final class MiniStackDeployPreflight {
         String localStackName = stackName == null || stackName.isBlank()
             ? null
             : LocalDeploymentNaming.localStackName(stackName, DeploymentTarget.MINISTACK);
-        LocalHostPortConflictChecker.validate(
-            DeploymentTarget.MINISTACK,
-            endpoint,
-            localStackName,
-            spec,
-            template,
-            violations);
+        if (checksHostPorts(LocalEmulatorSpec.ministack().image(),
+                System.getenv(MiniStackTemplateAdapter.ALB_FORWARD_ENV))) {
+            LocalHostPortConflictChecker.validate(
+                DeploymentTarget.MINISTACK,
+                endpoint,
+                localStackName,
+                spec,
+                template,
+                violations);
+        }
         return PreflightResult.of(DeploymentTarget.MINISTACK, violations);
+    }
+
+    /**
+     * Two applications collide on a host port only where MiniStack publishes task ports there, which
+     * 1.4 did and 1.5 and later do not: they are reached through the load balancer, so any number of
+     * stacks can use the same container port.
+     */
+    static boolean checksHostPorts(String pinnedImage, String forwardOverride) {
+        return !MiniStackTemplateAdapter.albForwardsToEcs(pinnedImage, forwardOverride);
     }
 
     private static void validateConfig(
@@ -87,25 +99,17 @@ public final class MiniStackDeployPreflight {
         if (config == null) {
             return;
         }
+        // CMS_SERVICE is what every CMS application (WordPress, Drupal, Joomla, Magento and the rest)
+        // uses, and all of them deploy on MiniStack.
         if (config.topology != null
                 && config.topology != TopologyType.APPLICATION_SERVICE
-                && config.topology != TopologyType.JENKINS_SERVICE) {
+                && config.topology != TopologyType.JENKINS_SERVICE
+                && config.topology != TopologyType.CMS_SERVICE) {
             violations.add(new PreflightViolation(
                 PreflightSeverity.BLOCK,
                 "TOPOLOGY_UNSUPPORTED",
-                "Topology " + config.topology + " is not supported on MiniStack MVP.",
-                "Use topology APPLICATION_SERVICE or deploy to AWS."));
-        }
-
-        boolean needsRds = Boolean.TRUE.equals(config.provisionDatabase)
-            || (spec != null && spec.requiresDatabase());
-        if (needsRds) {
-            violations.add(new PreflightViolation(
-                PreflightSeverity.BLOCK,
-                "RDS_REQUIRED",
-                "Application requires PostgreSQL/MySQL RDS, which MiniStack does not support "
-                    + "(AWS::RDS::DBParameterGroup and related types fail at create).",
-                RDS_SUGGESTION));
+                "Topology " + config.topology + " is not supported on MiniStack.",
+                "Use topology APPLICATION_SERVICE or CMS_SERVICE, or deploy to AWS."));
         }
     }
 
@@ -124,7 +128,7 @@ public final class MiniStackDeployPreflight {
                 PreflightSeverity.BLOCK,
                 "UNSUPPORTED_CFN_TYPES",
                 "Canonical template contains MiniStack-unsupported resources: " + resourceList,
-                RDS_SUGGESTION));
+                UNSUPPORTED_SUGGESTION));
         }
 
         if (template.toString().contains(LOCAL_EMULATOR_ZONE_MARKER)) {
