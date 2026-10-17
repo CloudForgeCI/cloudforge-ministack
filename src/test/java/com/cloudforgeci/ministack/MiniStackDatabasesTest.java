@@ -238,4 +238,12 @@ class MiniStackDatabasesTest {
         assertFalse(result.path("Resources").path("Admin").path("Properties").has("GenerateSecretString"));
         assertEquals(result, MiniStackDatabases.inlineGeneratedSecrets(template), "values are stable across deploys");
     }
+
+    @Test
+    void anExistingDatabaseIsReusedOnlyWhileItsContainerRuns() {
+        assertTrue(MiniStackDatabaseProvisioner.reusable(true, "ministack-rds-1-instance-db"));
+        assertFalse(MiniStackDatabaseProvisioner.reusable(true, null), "listed by the emulator but its container is gone");
+        assertFalse(MiniStackDatabaseProvisioner.reusable(false, "ministack-rds-1-instance-db"));
+        assertFalse(MiniStackDatabaseProvisioner.reusable(false, null));
+    }
 }

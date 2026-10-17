@@ -41,6 +41,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -56,6 +57,9 @@ public final class MiniStackDeployer implements LocalDeployer {
     public static final String REPLACE_SAME_APP_ENV = "CFC_MINISTACK_REPLACE_SAME_APP";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /** Outputs the adapter writes for the host directories that replace EFS file systems that are deleted with the stack. */
+    static final String HOST_VOLUME_OUTPUT_PREFIX = "MiniStackHostVolume";
     private static final Duration OPERATION_TIMEOUT = Duration.ofMinutes(15);
     private static final Duration POLL_INTERVAL = Duration.ofMillis(500);
 
@@ -152,6 +156,9 @@ public final class MiniStackDeployer implements LocalDeployer {
         boolean exists = stackExists(stackName);
         String templateBody = Files.readString(template);
         requireCdkBootstrap(templateBody);
+        if (!exists) {
+            emptyHostVolumes(hostVolumesIn(templateBody), MiniStackTemplateAdapter.defaultVolumeRoot());
+        }
         List<String> createdDatabases = new ArrayList<>();
         templateBody = compact(provisionDatabases(templateBody, createdDatabases));
         try {
@@ -235,6 +242,7 @@ public final class MiniStackDeployer implements LocalDeployer {
             return;
         }
         List<String> databases = deployedDatabases(stackName);
+        Map<String, String> outputs = outputs(stackName);
         try {
             cloudFormation.deleteStack(DeleteStackRequest.builder().stackName(stackName).build());
             cloudFormation.waiter().waitUntilStackDeleteComplete(
@@ -245,6 +253,76 @@ public final class MiniStackDeployer implements LocalDeployer {
         if (!databases.isEmpty()) {
             try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region)) {
                 provisioner.delete(databases);
+            }
+        }
+        removeHostVolumes(outputs, MiniStackTemplateAdapter.defaultVolumeRoot());
+    }
+
+    /**
+     * Deletes the host directories that stood in for the stack's EFS file systems, as deleting the
+     * stack deletes them. Left behind, they would be mounted by the next stack with the same name
+     * together with a new, empty database, and an application that found its own files would skip
+     * its installation. File systems the template retains are not listed in the outputs and are
+     * kept. Only directories under {@code root} are removed.
+     */
+    static void removeHostVolumes(Map<String, String> outputs, Path root) throws IOException {
+        for (Path volume : hostVolumes(outputs, root)) {
+            deleteRecursively(volume);
+            Path normalizedRoot = root.toAbsolutePath().normalize();
+            Path stackDirectory = volume.getParent();
+            if (stackDirectory != null && !stackDirectory.equals(normalizedRoot) && stackDirectory.startsWith(normalizedRoot)) {
+                try (var remaining = Files.list(stackDirectory)) {
+                    if (remaining.findAny().isEmpty()) {
+                        Files.delete(stackDirectory);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Empties the host directories of a stack that does not exist yet. A directory left by an earlier
+     * stack of the same name (one deleted by hand, or whose destroy did not finish) holds data that
+     * belongs to databases that are gone.
+     */
+    static void emptyHostVolumes(Map<String, String> outputs, Path root) throws IOException {
+        for (Path volume : hostVolumes(outputs, root)) {
+            deleteRecursively(volume);
+            Files.createDirectories(volume);
+        }
+    }
+
+    private static Map<String, String> hostVolumesIn(String templateBody) throws IOException {
+        Map<String, String> volumes = new LinkedHashMap<>();
+        JsonNode outputs = MAPPER.readTree(templateBody).path("Outputs");
+        outputs.properties().forEach(entry -> {
+            if (entry.getKey().startsWith(HOST_VOLUME_OUTPUT_PREFIX) && entry.getValue().path("Value").isTextual()) {
+                volumes.put(entry.getKey(), entry.getValue().path("Value").asText());
+            }
+        });
+        return volumes;
+    }
+
+    /** The existing directories listed under the host volume outputs that lie below {@code root}. */
+    private static List<Path> hostVolumes(Map<String, String> outputs, Path root) {
+        Path normalizedRoot = root.toAbsolutePath().normalize();
+        List<Path> volumes = new ArrayList<>();
+        for (Map.Entry<String, String> output : outputs.entrySet()) {
+            if (!output.getKey().startsWith(HOST_VOLUME_OUTPUT_PREFIX)) {
+                continue;
+            }
+            Path volume = Path.of(output.getValue()).toAbsolutePath().normalize();
+            if (volume.startsWith(normalizedRoot) && !volume.equals(normalizedRoot) && Files.exists(volume)) {
+                volumes.add(volume);
+            }
+        }
+        return volumes;
+    }
+
+    private static void deleteRecursively(Path directory) throws IOException {
+        try (var files = Files.walk(directory)) {
+            for (Path file : (Iterable<Path>) files.sorted(Comparator.reverseOrder())::iterator) {
+                Files.delete(file);
             }
         }
     }

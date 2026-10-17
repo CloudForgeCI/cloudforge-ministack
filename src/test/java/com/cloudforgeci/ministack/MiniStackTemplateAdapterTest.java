@@ -123,6 +123,22 @@ class MiniStackTemplateAdapterTest {
     }
 
     @Test
+    void aRetainedFileSystemIsNotListedAmongTheVolumesRemovedOnDestroy() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {"Resources": {
+              "Efs": {"Type": "AWS::EFS::FileSystem", "DeletionPolicy": "Retain", "Properties": {}},
+              "Task": {"Type": "AWS::ECS::TaskDefinition", "Properties": {
+                "ContainerDefinitions": [{"Name": "app", "Image": "x"}],
+                "Volumes": [{"Name": "appData", "EFSVolumeConfiguration": {"FilesystemId": {"Ref": "Efs"}}}]}}
+            }}""");
+
+        JsonNode outputs = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "retain-mini").template().path("Outputs");
+
+        assertTrue(outputs.has("MiniStackRetainedHostVolumeAppData"));
+        assertFalse(outputs.has("MiniStackHostVolumeAppData"), "the deployer removes only MiniStackHostVolume* on destroy");
+    }
+
+    @Test
     void removesApplicationAutoScalingResources() throws Exception {
         ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
             {

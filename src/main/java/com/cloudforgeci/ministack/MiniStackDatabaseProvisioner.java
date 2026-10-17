@@ -56,19 +56,33 @@ final class MiniStackDatabaseProvisioner implements AutoCloseable {
     private Map<String, Endpoint> provisionAll(List<Plan> plans) throws IOException {
         Map<String, Endpoint> endpoints = new LinkedHashMap<>();
         for (Plan plan : plans) {
-            if (find(plan.identifier()) == null) {
-                // The emulator does not know this database. A container left from an earlier run, whose
-                // emulator was restarted or whose deploy failed, would still own the name.
+            boolean recorded = find(plan.identifier()) != null;
+            if (!reusable(recorded, containerName(plan.identifier()))) {
+                if (recorded) {
+                    // The emulator lists the database but its container is gone, as after the
+                    // container was removed by hand. An application given its address would be refused.
+                    delete(List.of(plan.identifier()));
+                }
+                // A container left from an earlier run, whose emulator was restarted or whose deploy
+                // failed, could still own the name.
                 removeStaleContainers(plan.identifier());
                 create(plan);
                 created.add(plan.identifier());
             }
             DBInstance instance = waitUntilAvailable(plan.identifier());
+            if (containerName(plan.identifier()) == null) {
+                throw new IOException("MiniStack database " + plan.identifier() + " has no running container");
+            }
             Endpoint endpoint = endpointOf(plan, instance);
             waitUntilReady(plan, containerName(plan.identifier()));
             endpoints.put(plan.logicalId(), endpoint);
         }
         return endpoints;
+    }
+
+    /** An existing database is reused only while its container is running. */
+    static boolean reusable(boolean recorded, String runningContainer) {
+        return recorded && runningContainer != null;
     }
 
     /** Identifiers of the databases this provisioner created, as opposed to found already running. */

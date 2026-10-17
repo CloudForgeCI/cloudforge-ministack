@@ -700,11 +700,15 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         }
 
         Set<String> removedLogicalIds = new LinkedHashSet<>();
+        Set<String> retainedFileSystems = new LinkedHashSet<>();
         Iterator<Map.Entry<String, JsonNode>> fields = resources.properties().iterator();
         while (fields.hasNext()) {
             Map.Entry<String, JsonNode> entry = fields.next();
             if (entry.getValue().path("Type").asText().startsWith("AWS::EFS::")) {
                 removedLogicalIds.add(entry.getKey());
+                if (entry.getValue().path("DeletionPolicy").asText("").startsWith("Retain")) {
+                    retainedFileSystems.add(entry.getKey());
+                }
                 adaptations.add(new TemplateAdaptation(
                     "Resources." + entry.getKey(),
                     "MiniStack CloudFormation does not support AWS::EFS resources",
@@ -788,7 +792,11 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
                 volumes.set(index, replacement);
 
                 if (hostMountUsable) {
-                    String outputKey = hostVolumeOutputKey(volumeName);
+                    // A file system the template retains outlives the stack, so its directory is not
+                    // listed under the key the deployer removes on destroy.
+                    boolean retained = retainedFileSystems.contains(
+                        volume.path("EFSVolumeConfiguration").path("FilesystemId").path("Ref").asText(""));
+                    String outputKey = hostVolumeOutputKey(volumeName, retained);
                     if (!outputs.has(outputKey)) {
                         outputs.putObject(outputKey)
                             .put("Description",
@@ -829,8 +837,8 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         return root.toAbsolutePath().normalize();
     }
 
-    private static String hostVolumeOutputKey(String volumeName) {
-        return "MiniStackHostVolume"
+    private static String hostVolumeOutputKey(String volumeName, boolean retained) {
+        return (retained ? "MiniStackRetainedHostVolume" : MiniStackDeployer.HOST_VOLUME_OUTPUT_PREFIX)
             + volumeName.substring(0, 1).toUpperCase()
             + volumeName.substring(1);
     }
