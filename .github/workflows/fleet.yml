@@ -36,6 +36,9 @@ on:
       accounts:
         description: 'Comma-separated 12-digit account ids'
         default: '000000000000,111111111111,222222222222'
+      core_ref:
+        description: 'cfc-core branch or tag to deploy with'
+        default: 'feat/ministack-1-5-support'
       apps:
         description: 'Comma-separated application ids from validation/fleet-apps.json (default: all)'
         default: ''
@@ -72,6 +75,21 @@ jobs:
           java-version: '25'
           distribution: 'temurin'
           cache: 'maven'
+
+      # The fleet deploys with the cfc-core build of a named ref, not the -SNAPSHOT on Central: every cfc-core
+      # pull request publishes to that one coordinate, so the latest snapshot is whichever branch published last.
+      # Once the MiniStack 1.5 work is on develop, change the default ref to develop.
+      - name: Check out cfc-core
+        uses: actions/checkout@v4
+        with:
+          repository: CloudForgeCI/cfc-core
+          ref: ${{ inputs.core_ref || 'feat/ministack-1-5-support' }}
+          path: cfc-core
+
+      - name: Build cloudforge-api from the cfc-core checkout
+        run: |
+          mvn -B -q -DskipTests install
+          mvn -B -q -f cfc-core/pom.xml -pl .,cloudforge-core,cloudforge-api -DskipTests install
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

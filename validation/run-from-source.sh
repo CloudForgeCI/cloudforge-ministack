@@ -5,7 +5,8 @@
 #   validation/run-from-source.sh com.cloudforge.core.local.EmulatorEdgeCli reconcile
 #
 # The classpath is this module's classes, the dependencies Maven resolves for it (cloudforge-core), the
-# cloudforge-api of the same version (CLOUDFORGE_API_VERSION overrides it), then the installed CLI's own
+# cloudforge-api of the same version from the local Maven repository (CLOUDFORGE_API_VERSION overrides the
+# version; install the cfc-core checkout under test first), then the installed CLI's own
 # classes and libraries, so the code under test wins over the copies bundled with the CLI. cloudforge-api
 # holds the deploy logic, so a CLI release older than the checkout would otherwise deploy with its own. CLOUDFORGE_CLI_HOME points at the CLI's
 # libexec directory (default: Homebrew's cloudforge-cli); JAVA_HOME selects the JVM, as for the CLI.
@@ -21,8 +22,8 @@ fi
 
 API_VERSION="${CLOUDFORGE_API_VERSION:-$(cd "$ROOT" && mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)}"
 API_JAR="$ROOT/target/api/cloudforge-api-$API_VERSION.jar"
-if [[ ! -f "$API_JAR" || "$API_VERSION" == *-SNAPSHOT && -n "$(find "$API_JAR" -mmin +60 2>/dev/null)" ]]; then
-  (cd "$ROOT" && mvn -B -q -U dependency:copy -Dartifact="com.cloudforgeci:cloudforge-api:$API_VERSION:jar" \
+if [[ ! -f "$API_JAR" ]]; then
+  (cd "$ROOT" && mvn -B -q dependency:copy -Dartifact="com.cloudforgeci:cloudforge-api:$API_VERSION:jar" \
     -DoutputDirectory="$ROOT/target/api" >&2)
 fi
 
