@@ -3,9 +3,11 @@ name: Publish to Maven Central
 # Builds, tests, and publishes this module. Version is never bumped here; sync-cfc-core-version.yml
 # keeps it in lockstep with cfc-core's own version.
 #
-#   pull request   publishes the -SNAPSHOT version, so cfc-core and the other repos can build against
-#                  the change under review (as cfc-core's own pull requests do). Pull requests from
-#                  forks do not publish: they have no access to the secrets.
+#   pull request   against develop, publishes the -SNAPSHOT version, so cfc-core and the other repos
+#                  can build against the change under review (as cfc-core's own pull requests do).
+#                  Pull requests from forks do not publish: they have no access to the secrets.
+#   push to develop  publishes the -SNAPSHOT version again after a merge. develop is the default
+#                  branch, as in cfc-core, and only ever publishes snapshots.
 #   push to main   publishes the release version. When the pom still carries a -SNAPSHOT version
 #                  nothing is published, because a release needs a released cfc-core parent, which
 #                  sync-cfc-core-version.yml adopts once cfc-core publishes one.
@@ -15,10 +17,10 @@ name: Publish to Maven Central
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ develop ]
     types: [ opened, synchronize, reopened ]
   push:
-    branches: [ main ]
+    branches: [ develop, main ]
   workflow_dispatch: {}
 
 jobs:
@@ -73,6 +75,12 @@ jobs:
             else
               echo "::error::Version '$VERSION' is not a SNAPSHOT; pull requests publish snapshots only."
               exit 1
+            fi
+          elif [ "${{ github.ref_name }}" = "develop" ]; then
+            if [[ "$VERSION" == *-SNAPSHOT ]]; then
+              publish=true
+            else
+              echo "Version '$VERSION' is a release: releases are published from main."
             fi
           elif [[ "$VERSION" == *-SNAPSHOT ]]; then
             echo "Version '$VERSION' is a SNAPSHOT: nothing to release from this push."
