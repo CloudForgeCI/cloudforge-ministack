@@ -39,9 +39,6 @@ on:
       core_ref:
         description: 'cfc-core branch or tag to deploy with'
         default: 'feat/ministack-1-5-support'
-      cli_ref:
-        description: 'cloudforge-cli branch or tag whose classes run ahead of the released CLI'
-        default: 'fix/database-engine-version-choices'
       apps:
         description: 'Comma-separated application ids from validation/fleet-apps.json (default: all)'
         default: ''
@@ -64,7 +61,6 @@ jobs:
       ACCOUNTS: ${{ github.event_name == 'pull_request' && '000000000000,111111111111' || inputs.accounts || '000000000000,111111111111,222222222222' }}
       APPS: ${{ inputs.apps }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      CLI_TOKEN: ${{ secrets.CLOUDFORGE_CLI_TOKEN }}
       AWS_ENDPOINT_URL: http://localhost:4566
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
@@ -94,21 +90,6 @@ jobs:
         run: |
           mvn -B -q -DskipTests install
           mvn -B -q -f cfc-core/pom.xml -pl .,cloudforge-core,cloudforge-api -DskipTests install
-
-      # cloudforge-cli is a private repository, so this needs a token that can read it. Without the secret the
-      # released CLI runs instead, and its destroy looks in the default region only.
-      - name: Check out cloudforge-cli
-        if: ${{ env.CLI_TOKEN != '' }}
-        uses: actions/checkout@v4
-        with:
-          repository: CloudForgeCI/cloudforge-cli
-          ref: ${{ inputs.cli_ref || 'fix/database-engine-version-choices' }}
-          path: cloudforge-cli
-          token: ${{ secrets.CLOUDFORGE_CLI_TOKEN }}
-
-      - name: Compile cloudforge-cli
-        if: ${{ env.CLI_TOKEN != '' }}
-        run: mvn -B -q -f cloudforge-cli/pom.xml -DskipTests compile
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -142,7 +123,6 @@ jobs:
 
       - name: Deploy, check and destroy the fleet
         run: |
-          if [ -d cloudforge-cli/target/classes ]; then export CLOUDFORGE_CLI_CLASSES="$PWD/cloudforge-cli/target/classes"; fi
           export FLEET_CLI="$PWD/validation/run-from-source.sh com.cloudforgeci.cli.Main"
           export FLEET_RECONCILE_CMD="$PWD/validation/run-from-source.sh com.cloudforge.core.local.EmulatorEdgeCli reconcile"
           python3 -u validation/fleet.py --total "$TOTAL" --regions "$REGIONS" --accounts "$ACCOUNTS" ${APPS:+--apps "$APPS"} \
