@@ -35,7 +35,9 @@ import software.amazon.awssdk.services.ssm.SsmClient;
 import software.amazon.awssdk.services.ssm.model.ParameterNotFoundException;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URI;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -330,10 +332,42 @@ public final class MiniStackDeployer implements LocalDeployer {
     }
 
     private static void deleteRecursively(Path directory) throws IOException {
+        if (!Files.exists(directory)) {
+            return;
+        }
         try (var files = Files.walk(directory)) {
             for (Path file : (Iterable<Path>) files.sorted(Comparator.reverseOrder())::iterator) {
                 Files.delete(file);
             }
+        } catch (AccessDeniedException | UncheckedIOException e) {
+            removeAsRoot(directory, e);
+            Files.deleteIfExists(directory);
+        }
+    }
+
+    /**
+     * Removes a directory whose files an application container created as another user, which the
+     * deploying process cannot delete. On Linux hosts the container's user owns what it writes to a bind
+     * mount; the MiniStack container's image is used to remove it, since it is already present.
+     */
+    private static void removeAsRoot(Path directory, Exception cause) throws IOException {
+        try {
+            Process lookup = new ProcessBuilder("docker", "ps", "--filter", "name=^cfc-ministack$", "--format", "{{.Image}}")
+                .redirectErrorStream(true).start();
+            String image = new String(lookup.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            if (lookup.waitFor() != 0 || image.isEmpty()) {
+                throw new IOException("Could not find the MiniStack container to remove " + directory + " with", cause);
+            }
+            Process remove = new ProcessBuilder("docker", "run", "--rm", "--entrypoint", "sh",
+                "-v", directory.toAbsolutePath() + ":/volume", image, "-c", "rm -rf /volume/* /volume/.[!.]*")
+                .redirectErrorStream(true).start();
+            String output = new String(remove.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            if (remove.waitFor() != 0) {
+                throw new IOException("Could not remove " + directory + ": " + output, cause);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while removing " + directory, e);
         }
     }
 
