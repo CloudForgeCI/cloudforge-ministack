@@ -406,4 +406,47 @@ class MiniStackTemplateAdapterTest {
         assertFalse(MiniStackTemplateAdapter.isVersion15OrLater("ministackorg/ministack:latest"));
         assertFalse(MiniStackTemplateAdapter.isVersion15OrLater(null));
     }
+
+    @Test
+    void aSubdomainRecordIsRemovedAndGivesTheTaskItsOwnEdgeHostname() throws Exception {
+        ObjectNode template = (ObjectNode) MAPPER.readTree("""
+            {"Resources": {
+              "Record": {"Type": "AWS::Route53::RecordSet",
+                "Properties": {"Name": "jenkins2.example.com.", "HostedZoneId": "/hostedzone/LOCALEMULATORZONE"}},
+              "Task": {"Type": "AWS::ECS::TaskDefinition", "DependsOn": ["Record"],
+                "Properties": {"ContainerDefinitions": [
+                  {"Name": "app", "Environment": [{"Name": "A", "Value": "1"}]},
+                  {"Name": "sidecar"}]}}
+            }}""");
+
+        ObjectNode adapted = MiniStackTemplateAdapter.adapt(template).template();
+
+        assertFalse(adapted.path("Resources").has("Record"), "the record cannot be created on MiniStack");
+        assertFalse(adapted.path("Resources").path("Task").has("DependsOn"));
+        for (JsonNode container : adapted.path("Resources").path("Task").path("Properties").path("ContainerDefinitions")) {
+            Map<String, String> env = new HashMap<>();
+            container.path("Environment").forEach(e -> env.put(e.path("Name").asText(), e.path("Value").asText()));
+            assertEquals("jenkins2.cloudforge.localhost", env.get("CFC_LOCALSTACK_EDGE_HOSTNAME"),
+                container.path("Name").asText());
+        }
+    }
+
+    @Test
+    void aTemplateWithoutARecordKeepsItsContainersUntouched() throws Exception {
+        ObjectNode template = (ObjectNode) MAPPER.readTree("""
+            {"Resources": {"Task": {"Type": "AWS::ECS::TaskDefinition",
+              "Properties": {"ContainerDefinitions": [{"Name": "app"}]}}}}""");
+
+        ObjectNode adapted = MiniStackTemplateAdapter.adapt(template).template();
+
+        assertFalse(adapted.toString().contains("CFC_LOCALSTACK_EDGE_HOSTNAME"));
+    }
+
+    @Test
+    void edgeHostnameKeepsOnlyTheFirstLabel() {
+        assertEquals("jenkins1.cloudforge.localhost", MiniStackTemplateAdapter.edgeHostname("jenkins1.example.com."));
+        assertEquals("app.cloudforge.localhost", MiniStackTemplateAdapter.edgeHostname("App.Example.Org"));
+        assertEquals(null, MiniStackTemplateAdapter.edgeHostname(" "));
+        assertEquals(null, MiniStackTemplateAdapter.edgeHostname(null));
+    }
 }

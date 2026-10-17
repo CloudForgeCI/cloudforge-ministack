@@ -82,6 +82,7 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         replacePrivateCertificateAuthorityWithPlainHttp(local, adaptations);
         moveUnsupportedCognitoResourcesToMetadata(local, adaptations);
         markManagerAsLocalEmulatorTarget(local, adaptations);
+        routeSubdomainThroughTheEdge(local, adaptations);
         replaceUnsupportedEfsWithHostBindMounts(local, adaptations, stackName);
         inlineUnsupportedSecurityGroupIngress(local, adaptations);
         redirectUnsupportedEcsTargets(local, adaptations);
@@ -403,6 +404,94 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         return version.find()
             && (Integer.parseInt(version.group(1)) > 1
                 || (Integer.parseInt(version.group(1)) == 1 && Integer.parseInt(version.group(2)) >= 5));
+    }
+
+    /** Placeholder hosted zone id CloudForgeSynthesizer seeds for the shared local emulator account. */
+    static final String LOCAL_EMULATOR_ZONE_MARKER = "LOCALEMULATORZONE";
+
+    /** Environment variable the emulator edge reads to give a task its own hostname. */
+    static final String EDGE_HOSTNAME_ENV = "CFC_LOCALSTACK_EDGE_HOSTNAME";
+
+    /**
+     * A deployment with a {@code subdomain} creates a Route 53 record such as {@code
+     * jenkins2.example.com.}. The records that point at the placeholder hosted zone cannot be created
+     * on MiniStack and are removed. The record's first label gives the task its own edge hostname,
+     * {@code jenkins2.cloudforge.localhost}, passed to every container of the stack's tasks in {@code
+     * CFC_LOCALSTACK_EDGE_HOSTNAME}, so two stacks of one application are served on separate hosts
+     * instead of sharing the application's default one.
+     */
+    private static void routeSubdomainThroughTheEdge(
+            ObjectNode template,
+            List<TemplateAdaptation> adaptations) {
+        ObjectNode resources = asObject(template.get("Resources"));
+        if (resources == null) {
+            return;
+        }
+        List<String> remove = new ArrayList<>();
+        String recordName = null;
+        for (Map.Entry<String, JsonNode> entry : resources.properties()) {
+            if (!"AWS::Route53::RecordSet".equals(entry.getValue().path("Type").asText())) {
+                continue;
+            }
+            JsonNode name = entry.getValue().path("Properties").path("Name");
+            if (recordName == null && name.isTextual() && !name.asText().isBlank()) {
+                recordName = name.asText();
+            }
+            if (entry.getValue().toString().contains(LOCAL_EMULATOR_ZONE_MARKER)) {
+                remove.add(entry.getKey());
+            }
+        }
+        String edgeHostname = edgeHostname(recordName);
+        for (String key : remove) {
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + key,
+                "The record points at a hosted zone that does not exist on MiniStack; the emulator edge routes the hostname",
+                resources.get(key).deepCopy()));
+            resources.remove(key);
+        }
+        if (!remove.isEmpty()) {
+            dropDanglingDependsOn(resources, remove);
+        }
+        if (edgeHostname == null) {
+            return;
+        }
+        resources.properties().forEach(entry -> {
+            if (!"AWS::ECS::TaskDefinition".equals(entry.getValue().path("Type").asText())) {
+                return;
+            }
+            JsonNode containers = entry.getValue().path("Properties").path("ContainerDefinitions");
+            for (JsonNode container : containers) {
+                if (!(container instanceof ObjectNode containerNode)) {
+                    continue;
+                }
+                ArrayNode environment = container.path("Environment").isArray()
+                    ? (ArrayNode) container.path("Environment")
+                    : containerNode.putArray("Environment");
+                upsertEnvironment(environment, EDGE_HOSTNAME_ENV, edgeHostname);
+            }
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + entry.getKey() + ".Properties.ContainerDefinitions[*].Environment",
+                "Gives the task its own edge hostname, " + edgeHostname,
+                null));
+        });
+    }
+
+    /**
+     * {@code jenkins2.example.com.} becomes {@code jenkins2.cloudforge.localhost}: only the first label
+     * is kept, since the registered domain means nothing under the emulator's own suffix. Null when
+     * there is no usable record name.
+     */
+    static String edgeHostname(String route53RecordName) {
+        if (route53RecordName == null) {
+            return null;
+        }
+        String trimmed = route53RecordName.trim();
+        while (trimmed.endsWith(".")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        }
+        int dot = trimmed.indexOf('.');
+        String label = (dot < 0 ? trimmed : trimmed.substring(0, dot)).toLowerCase(Locale.ROOT).trim();
+        return label.isBlank() ? null : label + ".cloudforge.localhost";
     }
 
     /**

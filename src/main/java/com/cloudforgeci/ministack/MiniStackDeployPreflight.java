@@ -13,6 +13,7 @@ import com.cloudforge.core.local.PreflightSeverity;
 import com.cloudforge.core.local.PreflightViolation;
 import com.cloudforge.core.local.TemplateResourceScanner;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.net.URI;
@@ -38,6 +39,27 @@ public final class MiniStackDeployPreflight {
     // doesn't exist. Synthesis can't tell the two targets apart from the account alone; this
     // preflight check catches the result instead.
     private static final String LOCAL_EMULATOR_ZONE_MARKER = "LOCALEMULATORZONE";
+
+    /**
+     * The template as text without the Route 53 records that point at the placeholder zone. The
+     * adapter removes those records and routes their hostname through the emulator edge, so only a
+     * reference to the zone from anywhere else is a problem.
+     */
+    private static String withoutPlaceholderRecordSets(JsonNode template) {
+        JsonNode resources = template.path("Resources");
+        if (!resources.isObject()) {
+            return template.toString();
+        }
+        ObjectNode copy = template.deepCopy();
+        ObjectNode copyResources = (ObjectNode) copy.get("Resources");
+        resources.properties().forEach(entry -> {
+            if ("AWS::Route53::RecordSet".equals(entry.getValue().path("Type").asText())
+                    && entry.getValue().toString().contains(LOCAL_EMULATOR_ZONE_MARKER)) {
+                copyResources.remove(entry.getKey());
+            }
+        });
+        return copy.toString();
+    }
 
     private MiniStackDeployPreflight() {
     }
@@ -131,7 +153,7 @@ public final class MiniStackDeployPreflight {
                 UNSUPPORTED_SUGGESTION));
         }
 
-        if (template.toString().contains(LOCAL_EMULATOR_ZONE_MARKER)) {
+        if (withoutPlaceholderRecordSets(template).contains(LOCAL_EMULATOR_ZONE_MARKER)) {
             violations.add(new PreflightViolation(
                 PreflightSeverity.BLOCK,
                 "UNRESOLVABLE_HOSTED_ZONE",

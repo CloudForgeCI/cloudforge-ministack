@@ -144,15 +144,16 @@ class MiniStackDeployPreflightTest {
     }
 
     @Test
-    void blocksTemplateReferencingTheLocalEmulatorZoneMarker() throws Exception {
+    void blocksAReferenceToTheLocalEmulatorZoneOutsideItsRecordSets() throws Exception {
         // CloudForgeSynthesizer#seedHostedZoneContext seeds this placeholder for any local-emulator
         // deploy (LocalStack or MiniStack, indistinguishable by account alone) with an existing
-        // domain and createZone: false. Safe for LocalStack, which strips Route53 RecordSets before
-        // deploy; MiniStack does not, so a template still referencing it must be blocked here.
+        // domain and createZone: false. The adapter removes the Route 53 records that use it; any
+        // other resource that still refers to the zone cannot be deployed.
         ObjectNode template = MAPPER.createObjectNode();
-        ObjectNode record = template.putObject("Resources").putObject("DnsRecord");
-        record.put("Type", "AWS::Route53::RecordSet");
-        record.putObject("Properties").put("HostedZoneId", "/hostedzone/LOCALEMULATORZONE");
+        ObjectNode resources = template.putObject("Resources");
+        ObjectNode other = resources.putObject("Validation");
+        other.put("Type", "AWS::CertificateManager::Certificate");
+        other.putObject("Properties").put("HostedZoneId", "/hostedzone/LOCALEMULATORZONE");
         Path canonical = tempDir.resolve("with-domain.json");
         Files.writeString(canonical, MAPPER.writeValueAsString(template));
 
@@ -160,6 +161,20 @@ class MiniStackDeployPreflightTest {
 
         assertFalse(result.allowed(PreflightMode.ENFORCE));
         assertEquals("UNRESOLVABLE_HOSTED_ZONE", result.blockingViolations().getFirst().ruleId());
+    }
+
+    @Test
+    void allowsRecordSetsAtTheLocalEmulatorZoneBecauseTheAdapterRemovesThem() throws Exception {
+        ObjectNode template = MAPPER.createObjectNode();
+        ObjectNode record = template.putObject("Resources").putObject("DnsRecord");
+        record.put("Type", "AWS::Route53::RecordSet");
+        record.putObject("Properties").put("HostedZoneId", "/hostedzone/LOCALEMULATORZONE");
+        Path canonical = tempDir.resolve("subdomain.json");
+        Files.writeString(canonical, MAPPER.writeValueAsString(template));
+
+        PreflightResult result = MiniStackDeployPreflight.validate(new DeploymentConfig(), null, canonical);
+
+        assertTrue(result.allowed(PreflightMode.ENFORCE));
     }
 
     @Test
