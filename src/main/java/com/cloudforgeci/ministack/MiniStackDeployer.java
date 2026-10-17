@@ -300,7 +300,7 @@ public final class MiniStackDeployer implements LocalDeployer {
     static void emptyHostVolumes(Map<String, String> outputs, Path root) throws IOException {
         for (Path volume : hostVolumes(outputs, root)) {
             deleteRecursively(volume);
-            Files.createDirectories(volume);
+            MiniStackTemplateAdapter.createVolumeDirectory(volume);
         }
     }
 

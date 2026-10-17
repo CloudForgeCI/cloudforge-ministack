@@ -10,6 +10,7 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -106,5 +107,12 @@ class MiniStackDeployerLifecycleTest {
             server.stop(0);
         }
         assertTrue(authorization.get().contains("Credential=ASIAASSUMEDROLE/"), authorization.get());
+    }
+
+    @Test
+    void aVolumeDirectoryIsWritableByAnyUser(@TempDir Path temp) throws Exception {
+        Path volume = temp.resolve("Stack").resolve("jenkinsHome");
+        MiniStackTemplateAdapter.createVolumeDirectory(volume);
+        assertEquals("rwxrwxrwx", PosixFilePermissions.toString(Files.getPosixFilePermissions(volume)));
     }
 }

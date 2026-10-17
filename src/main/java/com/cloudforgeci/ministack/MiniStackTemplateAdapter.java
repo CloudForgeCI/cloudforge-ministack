@@ -16,6 +16,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -39,6 +40,20 @@ import java.util.regex.Pattern;
  */
 public final class MiniStackTemplateAdapter implements TemplateAdapter {
     public static final MiniStackTemplateAdapter INSTANCE = new MiniStackTemplateAdapter();
+
+    /**
+     * Creates a host directory for a volume and lets any user write to it. Application images run as an
+     * unprivileged user (Jenkins, Grafana), and on a Linux host a bind mount keeps the owner of the
+     * directory, so one created by the deploying user would be read-only to the container.
+     */
+    static void createVolumeDirectory(Path directory) throws IOException {
+        Files.createDirectories(directory);
+        try {
+            Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("rwxrwxrwx"));
+        } catch (UnsupportedOperationException e) {
+            // A file system without POSIX permissions has no owner to work around.
+        }
+    }
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String DEFAULT_VOLUME_ROOT = ".ministack-volumes";
@@ -762,7 +777,7 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
                 String reason;
                 boolean hostMountUsable;
                 try {
-                    Files.createDirectories(hostPath);
+                    createVolumeDirectory(hostPath);
                     hostMountUsable = true;
                 } catch (IOException e) {
                     // Mirrors LocalStackTemplateAdapter's equivalent block (see its comment).
