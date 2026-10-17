@@ -47,9 +47,12 @@ ENV.pop("CFC_DEPLOYING", None)
 ENV.pop("CFC_MINISTACK_REPLACE_SAME_APP", None)
 
 
-def env_for(account):
-    """The environment of a process acting in `account`: MiniStack reads the account from the access key."""
-    return {**ENV, "AWS_ACCESS_KEY_ID": account if account != DEFAULT_ACCOUNT else "test"}
+def env_for(account, region=None):
+    """The environment of a process acting in `account` and `region`: MiniStack reads the account from the access key."""
+    env = {**ENV, "AWS_ACCESS_KEY_ID": account if account != DEFAULT_ACCOUNT else "test"}
+    if region:
+        env["AWS_DEFAULT_REGION"] = region
+    return env
 
 
 def region_abbreviation(region):
@@ -131,11 +134,11 @@ def ensure_bootstrapped(account, region):
                    capture_output=True, text=True, timeout=600, check=True)
 
 
-def run_cli(verb, context_file, timeout, account):
+def run_cli(verb, context_file, timeout, account, region):
     try:
         result = subprocess.run([*shlex.split(os.environ.get("FLEET_CLI", "cloudforge-cli")), verb,
                                  "--context", str(context_file), "--target", "ministack"],
-                                capture_output=True, text=True, env=env_for(account), timeout=timeout)
+                                capture_output=True, text=True, env=env_for(account, region), timeout=timeout)
         return result.returncode, result.stdout
     except subprocess.TimeoutExpired:
         return 124, ""
@@ -163,7 +166,7 @@ def deploy_one(item, work, timeout):
     context_file = work / f"{item['stackName']}.json"
     context_file.write_text(json.dumps(context_for(item), indent=2))
     started = time.time()
-    code, output = run_cli("deploy", context_file, timeout, item["account"])
+    code, output = run_cli("deploy", context_file, timeout, item["account"], item["region"])
     final = last_phase_status(output, "deploy")
     item["deployed"] = final.get("status") == "complete"
     item["deploySeconds"] = round(time.time() - started)
@@ -245,8 +248,10 @@ def check_regions(wave, pairs):
 
 
 def destroy_one(item, work, timeout):
-    code, output = run_cli("destroy", work / f"{item['stackName']}.json", timeout, item["account"])
+    code, output = run_cli("destroy", work / f"{item['stackName']}.json", timeout, item["account"], item["region"])
     item["destroyed"] = last_phase_status(output, "destroy").get("status") == "complete"
+    if not item["destroyed"]:
+        item["destroyError"] = f"exit {code}: " + output.strip()[-400:]
     return item
 
 
@@ -270,7 +275,7 @@ def verdict(item):
     elif item["expect"] == "http" and not (isinstance(item.get("httpStatus"), int) and item["httpStatus"] < 500):
         failures.append(f"{item['hostname']}{item['path']} answered {item.get('httpStatus')}")
     if item.get("destroyed") is False:
-        failures.append("destroy failed")
+        failures.append("destroy failed: " + item.get("destroyError", ""))
     return failures
 
 
