@@ -39,6 +39,9 @@ on:
       core_ref:
         description: 'cfc-core branch or tag to deploy with'
         default: 'feat/ministack-1-5-support'
+      cli_ref:
+        description: 'cloudforge-cli branch or tag whose classes run ahead of the released CLI'
+        default: 'fix/database-engine-version-choices'
       apps:
         description: 'Comma-separated application ids from validation/fleet-apps.json (default: all)'
         default: ''
@@ -91,6 +94,16 @@ jobs:
           mvn -B -q -DskipTests install
           mvn -B -q -f cfc-core/pom.xml -pl .,cloudforge-core,cloudforge-api -DskipTests install
 
+      - name: Check out cloudforge-cli
+        uses: actions/checkout@v4
+        with:
+          repository: CloudForgeCI/cloudforge-cli
+          ref: ${{ inputs.cli_ref || 'fix/database-engine-version-choices' }}
+          path: cloudforge-cli
+
+      - name: Compile cloudforge-cli
+        run: mvn -B -q -f cloudforge-cli/pom.xml -DskipTests compile
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -123,6 +136,7 @@ jobs:
 
       - name: Deploy, check and destroy the fleet
         run: |
+          export CLOUDFORGE_CLI_CLASSES="$PWD/cloudforge-cli/target/classes"
           export FLEET_CLI="$PWD/validation/run-from-source.sh com.cloudforgeci.cli.Main"
           export FLEET_RECONCILE_CMD="$PWD/validation/run-from-source.sh com.cloudforge.core.local.EmulatorEdgeCli reconcile"
           python3 -u validation/fleet.py --total "$TOTAL" --regions "$REGIONS" --accounts "$ACCOUNTS" ${APPS:+--apps "$APPS"} \

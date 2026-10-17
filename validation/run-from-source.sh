@@ -33,4 +33,5 @@ if [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]]; then
 fi
 MAIN="${1:?usage: $0 <main-class> [arguments]}"
 shift
-exec "$JAVA" -cp "$ROOT/target/classes:$(cat "$CLASSPATH_FILE"):$API_JAR:$CLI_HOME/classes:$CLI_HOME/dependency/*" "$MAIN" "$@"
+# CLOUDFORGE_CLI_CLASSES, when set, is a compiled cloudforge-cli checkout whose classes go ahead of the installed CLI's.
+exec "$JAVA" -cp "$ROOT/target/classes:$(cat "$CLASSPATH_FILE"):$API_JAR:${CLOUDFORGE_CLI_CLASSES:+$CLOUDFORGE_CLI_CLASSES:}$CLI_HOME/classes:$CLI_HOME/dependency/*" "$MAIN" "$@"
