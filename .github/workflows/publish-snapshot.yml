@@ -28,8 +28,10 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
+      # -DskipTests=false: the cfc-core parent pom defaults skipTests to true, and its published form
+      # has no -Pci profile to turn them back on, so without it this step builds without running them.
       - name: Build and test
-        run: mvn -B clean verify
+        run: mvn -B -DskipTests=false clean verify
 
   publish:
     name: Sign and publish to Central
