@@ -14,7 +14,6 @@ import java.util.Optional;
  */
 final class MiniStackCdkBootstrap {
     /** Account id MiniStack reports for every request. */
-    static final String ACCOUNT_ID = "000000000000";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -37,10 +36,10 @@ final class MiniStackCdkBootstrap {
     static String instructions(String endpoint, String region, String parameter) {
         return "This MiniStack has not been CDK-bootstrapped in " + region + " (SSM parameter "
             + parameter + " does not exist).\n\n"
-            + "Bootstrap it once per region, as you would an AWS account:\n\n"
-            + "  AWS_ENDPOINT_URL=" + endpoint + " AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \\\n"
+            + "Bootstrap it once per account and region, as you would an AWS account:\n\n"
+            + "  AWS_ENDPOINT_URL=" + endpoint + " AWS_ACCESS_KEY_ID=" + MiniStackCredentials.fromEnvironment().accessKeyId() + " AWS_SECRET_ACCESS_KEY=test \\\n"
             + "  AWS_DEFAULT_REGION=" + region + " \\\n"
-            + "  cdk bootstrap aws://" + ACCOUNT_ID + "/" + region + "\n\n"
-            + "Bootstrapping is per region and does not persist if the emulator container is recreated.";
+            + "  cdk bootstrap aws://" + MiniStackCredentials.accountId() + "/" + region + "\n\n"
+            + "Bootstrapping is per account and region and does not persist if the emulator container is recreated.";
     }
 }

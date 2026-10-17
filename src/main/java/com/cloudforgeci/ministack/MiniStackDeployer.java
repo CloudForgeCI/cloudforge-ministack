@@ -10,7 +10,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.nio.charset.StandardCharsets;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
@@ -67,6 +67,7 @@ public final class MiniStackDeployer implements LocalDeployer {
     private final SsmClient ssm;
     private final String endpoint;
     private final String region;
+    private final AwsCredentialsProvider credentials;
 
     public MiniStackDeployer() {
         this(
@@ -89,18 +90,27 @@ public final class MiniStackDeployer implements LocalDeployer {
 
     /** Visible for tests and custom endpoint wiring. */
     public MiniStackDeployer(String endpoint, String region) {
+        this(endpoint, region, null);
+    }
+
+    /**
+     * Signs requests with {@code credentials}, for example the credentials of an assumed role in
+     * another account. Without them the account comes from {@code AWS_ACCESS_KEY_ID}.
+     */
+    public MiniStackDeployer(String endpoint, String region, AwsCredentialsProvider credentials) {
         this.endpoint = endpoint;
         this.region = region;
-        var credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+        this.credentials = credentials != null
+            ? credentials : StaticCredentialsProvider.create(MiniStackCredentials.fromEnvironment());
         cloudFormation = CloudFormationClient.builder()
             .endpointOverride(URI.create(endpoint))
             .region(Region.of(region))
-            .credentialsProvider(credentials)
+            .credentialsProvider(this.credentials)
             .build();
         ssm = SsmClient.builder()
             .endpointOverride(URI.create(endpoint))
             .region(Region.of(region))
-            .credentialsProvider(credentials)
+            .credentialsProvider(this.credentials)
             .build();
     }
 
@@ -131,7 +141,7 @@ public final class MiniStackDeployer implements LocalDeployer {
         if (plans.isEmpty()) {
             return MAPPER.writeValueAsString(MiniStackDatabases.inlineGeneratedSecrets(template));
         }
-        try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region)) {
+        try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region, credentials)) {
             var endpoints = provisioner.provision(plans);
             createdDatabases.addAll(provisioner.createdIdentifiers());
             return MAPPER.writeValueAsString(MiniStackDatabases.inlineGeneratedSecrets(
@@ -167,7 +177,7 @@ public final class MiniStackDeployer implements LocalDeployer {
             // A first deploy that fails leaves no stack, so a later destroy cannot find the databases it
             // created. Remove them here.
             if (!exists && !createdDatabases.isEmpty()) {
-                try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region)) {
+                try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region, credentials)) {
                     provisioner.delete(createdDatabases);
                 }
             }
@@ -251,7 +261,7 @@ public final class MiniStackDeployer implements LocalDeployer {
             throw new IOException("Failed to delete MiniStack stack " + stackName, e);
         }
         if (!databases.isEmpty()) {
-            try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region)) {
+            try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region, credentials)) {
                 provisioner.delete(databases);
             }
         }

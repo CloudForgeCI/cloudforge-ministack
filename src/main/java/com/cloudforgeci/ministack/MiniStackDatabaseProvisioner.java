@@ -4,8 +4,7 @@ import com.cloudforge.core.local.LocalEmulatorDefaults;
 import com.cloudforgeci.ministack.MiniStackDatabases.Endpoint;
 import com.cloudforgeci.ministack.MiniStackDatabases.Plan;
 import java.util.ArrayList;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.rds.RdsClient;
 import software.amazon.awssdk.services.rds.model.DBInstance;
@@ -34,11 +33,11 @@ final class MiniStackDatabaseProvisioner implements AutoCloseable {
     private final RdsClient rds;
     private final List<String> created = new ArrayList<>();
 
-    MiniStackDatabaseProvisioner(String endpoint, String region) {
+    MiniStackDatabaseProvisioner(String endpoint, String region, AwsCredentialsProvider credentials) {
         rds = RdsClient.builder()
             .endpointOverride(URI.create(endpoint))
             .region(Region.of(region))
-            .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+            .credentialsProvider(credentials)
             .build();
     }
 

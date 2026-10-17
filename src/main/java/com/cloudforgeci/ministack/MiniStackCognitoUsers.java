@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cognitoidentityprovider.CognitoIdentityProviderClient;
@@ -93,7 +92,7 @@ final class MiniStackCognitoUsers {
         try (CognitoIdentityProviderClient cognito = CognitoIdentityProviderClient.builder()
                 .endpointOverride(URI.create(endpoint))
                 .region(Region.of(region))
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .credentialsProvider(StaticCredentialsProvider.create(MiniStackCredentials.fromEnvironment()))
                 .build()) {
             for (JsonNode user : recorded.path("users")) {
                 String logicalPool = user.path("pool").asText();
