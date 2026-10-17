@@ -6,8 +6,11 @@ import com.cloudforge.core.local.LocalDeployer;
 import com.cloudforge.core.local.LocalDeploymentCatalog;
 import com.cloudforge.core.local.LocalResourceChange;
 import com.cloudforge.core.local.LocalSameApplicationStackReplacer;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.nio.charset.StandardCharsets;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
@@ -28,14 +31,19 @@ import software.amazon.awssdk.services.cloudformation.model.Output;
 import software.amazon.awssdk.services.cloudformation.model.ResourceChange;
 import software.amazon.awssdk.services.cloudformation.model.StackSummary;
 import software.amazon.awssdk.services.cloudformation.model.Tag;
+import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.ssm.model.ParameterNotFoundException;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URI;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -51,10 +59,17 @@ public final class MiniStackDeployer implements LocalDeployer {
     public static final String REPLACE_SAME_APP_ENV = "CFC_MINISTACK_REPLACE_SAME_APP";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /** Outputs the adapter writes for the host directories that replace EFS file systems that are deleted with the stack. */
+    static final String HOST_VOLUME_OUTPUT_PREFIX = "MiniStackHostVolume";
     private static final Duration OPERATION_TIMEOUT = Duration.ofMinutes(15);
     private static final Duration POLL_INTERVAL = Duration.ofMillis(500);
 
     private final CloudFormationClient cloudFormation;
+    private final SsmClient ssm;
+    private final String endpoint;
+    private final String region;
+    private final AwsCredentialsProvider credentials;
 
     public MiniStackDeployer() {
         this(
@@ -77,18 +92,102 @@ public final class MiniStackDeployer implements LocalDeployer {
 
     /** Visible for tests and custom endpoint wiring. */
     public MiniStackDeployer(String endpoint, String region) {
+        this(endpoint, region, null);
+    }
+
+    /**
+     * Signs requests with {@code credentials}, for example the credentials of an assumed role in
+     * another account. Without them the account comes from {@code AWS_ACCESS_KEY_ID}.
+     */
+    public MiniStackDeployer(String endpoint, String region, AwsCredentialsProvider credentials) {
+        this.endpoint = endpoint;
+        this.region = region;
+        this.credentials = credentials != null
+            ? credentials : StaticCredentialsProvider.create(MiniStackCredentials.fromEnvironment());
         cloudFormation = CloudFormationClient.builder()
             .endpointOverride(URI.create(endpoint))
             .region(Region.of(region))
-            .credentialsProvider(StaticCredentialsProvider.create(
-                AwsBasicCredentials.create("test", "test")))
+            .credentialsProvider(this.credentials)
             .build();
+        ssm = SsmClient.builder()
+            .endpointOverride(URI.create(endpoint))
+            .region(Region.of(region))
+            .credentialsProvider(this.credentials)
+            .build();
+    }
+
+    /** CloudFormation rejects an inline template body over this many bytes; larger ones need S3. */
+    static final int MAX_INLINE_TEMPLATE_BYTES = 51_200;
+
+    /**
+     * The template without the whitespace CDK pretty-prints it with, which is more than half its size.
+     * Fails with an explanation when it is still too large to send inline.
+     */
+    static String compact(String templateBody) throws IOException {
+        String compact = MAPPER.writeValueAsString(MAPPER.readTree(templateBody));
+        int bytes = compact.getBytes(StandardCharsets.UTF_8).length;
+        if (bytes > MAX_INLINE_TEMPLATE_BYTES) {
+            throw new IOException("The template is " + bytes + " bytes, over the " + MAX_INLINE_TEMPLATE_BYTES
+                + "-byte limit CloudFormation accepts inline. Real AWS needs it uploaded to S3 as well.");
+        }
+        return compact;
+    }
+
+    /**
+     * Creates the databases the template asks for and returns the template rewritten to use them,
+     * with generated secrets given local values.
+     */
+    private String provisionDatabases(String templateBody, List<String> createdDatabases) throws IOException {
+        var template = (ObjectNode) MAPPER.readTree(templateBody);
+        var plans = MiniStackDatabases.plan(template);
+        if (plans.isEmpty()) {
+            return MAPPER.writeValueAsString(MiniStackDatabases.inlineGeneratedSecrets(template));
+        }
+        try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region, credentials)) {
+            var endpoints = provisioner.provision(plans);
+            createdDatabases.addAll(provisioner.createdIdentifiers());
+            return MAPPER.writeValueAsString(MiniStackDatabases.inlineGeneratedSecrets(
+                MiniStackDatabases.rewrite(template, plans, endpoints)));
+        }
+    }
+
+    private void requireCdkBootstrap(String templateBody) throws IOException {
+        var parameter = MiniStackCdkBootstrap.requiredParameter(templateBody);
+        if (parameter.isEmpty()) {
+            return;
+        }
+        try {
+            ssm.getParameter(r -> r.name(parameter.get()));
+        } catch (ParameterNotFoundException e) {
+            throw new IOException(MiniStackCdkBootstrap.instructions(endpoint, region, parameter.get()), e);
+        }
     }
 
     @Override
     public LocalDeployResult deploy(String stackName, Path template) throws IOException {
         boolean exists = stackExists(stackName);
         String templateBody = Files.readString(template);
+        requireCdkBootstrap(templateBody);
+        if (!exists) {
+            emptyHostVolumes(hostVolumesIn(templateBody), MiniStackTemplateAdapter.defaultVolumeRoot());
+        }
+        List<String> createdDatabases = new ArrayList<>();
+        templateBody = compact(provisionDatabases(templateBody, createdDatabases));
+        try {
+            return deployStack(stackName, templateBody, exists);
+        } catch (IOException | RuntimeException e) {
+            // A first deploy that fails leaves no stack, so a later destroy cannot find the databases it
+            // created. Remove them here.
+            if (!exists && !createdDatabases.isEmpty()) {
+                try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region, credentials)) {
+                    provisioner.delete(createdDatabases);
+                }
+            }
+            throw e;
+        }
+    }
+
+    private LocalDeployResult deployStack(String stackName, String templateBody, boolean exists) throws IOException {
         if (exists && templateMatches(stackName, templateBody)) {
             return new LocalDeployResult(stackName, false, true, List.of(), outputs(stackName));
         }
@@ -134,7 +233,19 @@ public final class MiniStackDeployer implements LocalDeployer {
             );
         }
 
+        createCognitoUsers(stackName, templateBody);
         return new LocalDeployResult(stackName, !exists, false, changes, outputs(stackName));
+    }
+
+    /** Creates the Cognito users the template declared, which MiniStack's CloudFormation cannot. */
+    private void createCognitoUsers(String stackName, String templateBody) throws IOException {
+        JsonNode recorded = MAPPER.readTree(templateBody).path("Metadata").path(MiniStackCognitoUsers.METADATA_KEY);
+        if (recorded.isMissingNode()) {
+            return;
+        }
+        MiniStackCognitoUsers.create(recorded, endpoint, region, logicalId -> cloudFormation
+            .describeStackResource(r -> r.stackName(stackName).logicalResourceId(logicalId))
+            .stackResourceDetail().physicalResourceId());
     }
 
     @Override
@@ -142,12 +253,121 @@ public final class MiniStackDeployer implements LocalDeployer {
         if (!stackExists(stackName)) {
             return;
         }
+        List<String> databases = deployedDatabases(stackName);
+        Map<String, String> outputs = outputs(stackName);
         try {
             cloudFormation.deleteStack(DeleteStackRequest.builder().stackName(stackName).build());
             cloudFormation.waiter().waitUntilStackDeleteComplete(
                 DescribeStacksRequest.builder().stackName(stackName).build());
         } catch (Exception e) {
             throw new IOException("Failed to delete MiniStack stack " + stackName, e);
+        }
+        if (!databases.isEmpty()) {
+            try (MiniStackDatabaseProvisioner provisioner = new MiniStackDatabaseProvisioner(endpoint, region, credentials)) {
+                provisioner.delete(databases);
+            }
+        }
+        removeHostVolumes(outputs, MiniStackTemplateAdapter.defaultVolumeRoot());
+    }
+
+    /**
+     * Deletes the host directories that stood in for the stack's EFS file systems, as deleting the
+     * stack deletes them. Left behind, they would be mounted by the next stack with the same name
+     * together with a new, empty database, and an application that found its own files would skip
+     * its installation. File systems the template retains are not listed in the outputs and are
+     * kept. Only directories under {@code root} are removed.
+     */
+    static void removeHostVolumes(Map<String, String> outputs, Path root) throws IOException {
+        for (Path volume : hostVolumes(outputs, root)) {
+            deleteRecursively(volume);
+            Path normalizedRoot = root.toAbsolutePath().normalize();
+            Path stackDirectory = volume.getParent();
+            if (stackDirectory != null && !stackDirectory.equals(normalizedRoot) && stackDirectory.startsWith(normalizedRoot)) {
+                try (var remaining = Files.list(stackDirectory)) {
+                    if (remaining.findAny().isEmpty()) {
+                        Files.delete(stackDirectory);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Empties the host directories of a stack that does not exist yet. A directory left by an earlier
+     * stack of the same name (one deleted by hand, or whose destroy did not finish) holds data that
+     * belongs to databases that are gone.
+     */
+    static void emptyHostVolumes(Map<String, String> outputs, Path root) throws IOException {
+        for (Path volume : hostVolumes(outputs, root)) {
+            deleteRecursively(volume);
+            MiniStackTemplateAdapter.createVolumeDirectory(volume);
+        }
+    }
+
+    private static Map<String, String> hostVolumesIn(String templateBody) throws IOException {
+        Map<String, String> volumes = new LinkedHashMap<>();
+        JsonNode outputs = MAPPER.readTree(templateBody).path("Outputs");
+        outputs.properties().forEach(entry -> {
+            if (entry.getKey().startsWith(HOST_VOLUME_OUTPUT_PREFIX) && entry.getValue().path("Value").isTextual()) {
+                volumes.put(entry.getKey(), entry.getValue().path("Value").asText());
+            }
+        });
+        return volumes;
+    }
+
+    /** The existing directories listed under the host volume outputs that lie below {@code root}. */
+    private static List<Path> hostVolumes(Map<String, String> outputs, Path root) {
+        Path normalizedRoot = root.toAbsolutePath().normalize();
+        List<Path> volumes = new ArrayList<>();
+        for (Map.Entry<String, String> output : outputs.entrySet()) {
+            if (!output.getKey().startsWith(HOST_VOLUME_OUTPUT_PREFIX)) {
+                continue;
+            }
+            Path volume = Path.of(output.getValue()).toAbsolutePath().normalize();
+            if (volume.startsWith(normalizedRoot) && !volume.equals(normalizedRoot) && Files.exists(volume)) {
+                volumes.add(volume);
+            }
+        }
+        return volumes;
+    }
+
+    private static void deleteRecursively(Path directory) throws IOException {
+        if (!Files.exists(directory)) {
+            return;
+        }
+        try (var files = Files.walk(directory)) {
+            for (Path file : (Iterable<Path>) files.sorted(Comparator.reverseOrder())::iterator) {
+                Files.delete(file);
+            }
+        } catch (AccessDeniedException | UncheckedIOException e) {
+            removeAsRoot(directory, e);
+            Files.deleteIfExists(directory);
+        }
+    }
+
+    /**
+     * Removes a directory whose files an application container created as another user, which the
+     * deploying process cannot delete. On Linux hosts the container's user owns what it writes to a bind
+     * mount; the MiniStack container's image is used to remove it, since it is already present.
+     */
+    private static void removeAsRoot(Path directory, Exception cause) throws IOException {
+        try {
+            Process lookup = new ProcessBuilder("docker", "ps", "--filter", "name=^cfc-ministack$", "--format", "{{.Image}}")
+                .redirectErrorStream(true).start();
+            String image = new String(lookup.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            if (lookup.waitFor() != 0 || image.isEmpty()) {
+                throw new IOException("Could not find the MiniStack container to remove " + directory + " with", cause);
+            }
+            Process remove = new ProcessBuilder("docker", "run", "--rm", "--entrypoint", "sh",
+                "-v", directory.toAbsolutePath() + ":/volume", image, "-c", "rm -rf /volume/* /volume/.[!.]*")
+                .redirectErrorStream(true).start();
+            String output = new String(remove.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            if (remove.waitFor() != 0) {
+                throw new IOException("Could not remove " + directory + ": " + output, cause);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while removing " + directory, e);
         }
     }
 
@@ -291,6 +511,17 @@ public final class MiniStackDeployer implements LocalDeployer {
             .build());
     }
 
+    /** The databases created for the stack, recorded in its deployed template. */
+    private List<String> deployedDatabases(String stackName) {
+        try {
+            String deployed = cloudFormation.getTemplate(
+                GetTemplateRequest.builder().stackName(stackName).build()).templateBody();
+            return MiniStackDatabases.provisionedIdentifiers(MAPPER.readTree(deployed));
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
     private boolean templateMatches(String stackName, String candidate) throws IOException {
         try {
             String deployed = cloudFormation.getTemplate(
@@ -357,6 +588,7 @@ public final class MiniStackDeployer implements LocalDeployer {
     @Override
     public void close() {
         cloudFormation.close();
+        ssm.close();
     }
 
     /** @deprecated use {@link LocalResourceChange}. */

@@ -22,8 +22,12 @@ public final class MiniStackEmulatorRuntime extends AbstractLocalEmulatorRuntime
     @Override
     protected List<String> dockerCreateArgs() throws IOException {
         List<String> args = new ArrayList<>(baseDockerCreateArgs());
+        // MiniStack 1.4 proxied its databases through this range. 1.5 and later publish each
+        // database's own port on the host, so reserving the range here makes them collide.
+        if (!MiniStackTemplateAdapter.isVersion15OrLater(spec().image())) {
+            args.addAll(List.of("-p", "15432-15442:15432-15442"));
+        }
         args.addAll(List.of(
-            "-p", "15432-15442:15432-15442",
             "-e", "MINISTACK_REGION=" + region(),
             "-e", "GATEWAY_PORT=4566",
             "-e", "PERSIST_STATE=0",

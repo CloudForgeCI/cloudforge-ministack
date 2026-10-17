@@ -11,7 +11,7 @@
     <groupId>com.cloudforgeci</groupId>
     <artifactId>cfc-core</artifactId>
     <!-- Tracks cfc-core's latest published SNAPSHOT — kept current by sync-versions.yml. -->
-    <version>3.2.20-SNAPSHOT</version>
+    <version>3.3.3-SNAPSHOT</version>
     <relativePath/>
   </parent>
 
@@ -20,7 +20,7 @@
        which has its own independent release cadence): this module was a reactor member of
        cfc-core until it moved to its own repository, and stays released alongside it on the same
        version number, just via a <parent> reference instead of reactor membership. -->
-  <version>3.2.20-SNAPSHOT</version>
+  <version>3.3.3-SNAPSHOT</version>
   <packaging>jar</packaging>
   <name>CloudForge MiniStack</name>
   <description>MiniStack local deployment adapter, deployer, and pipeline for CloudForge templates</description>
@@ -64,6 +64,21 @@
     <dependency>
       <groupId>software.amazon.awssdk</groupId>
       <artifactId>cloudformation</artifactId>
+      <version>${aws.sdk.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>ssm</artifactId>
+      <version>${aws.sdk.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>rds</artifactId>
+      <version>${aws.sdk.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>cognitoidentityprovider</artifactId>
       <version>${aws.sdk.version}</version>
     </dependency>
 
@@ -111,6 +126,9 @@
       </plugin>
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
+        <!-- Pinned: with 3.6.0, which the published cfc-core parent leaves to Maven's default, the
+             excludedGroups below no longer kept the tests that need a running MiniStack out of the build. -->
+        <version>3.5.4</version>
         <configuration>
           <excludedGroups>ministack</excludedGroups>
         </configuration>

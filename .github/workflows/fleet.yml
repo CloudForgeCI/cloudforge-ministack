@@ -1,0 +1,149 @@
+name: MiniStack fleet
+
+# Deploys a fleet of applications to MiniStack across several accounts and regions, checks every one, destroys
+# them and checks that nothing is left (validation/fleet.py). The fleet is split into waves that fit
+# the runner's memory, so a plan of 30 to 50 deployments runs in a few waves.
+#
+#   pull request   a nine deployment smoke across two accounts and two regions, when the adapter,
+#                  deployer or the fleet itself changes
+#   schedule       the full 30 deployment fleet across three accounts and three regions every Monday
+#   dispatch       any size up to 50, any accounts and regions
+#
+# MiniStack gives each 12-digit access key its own account, so the fleet runs each deployment with
+# AWS_ACCESS_KEY_ID set to the account it targets.
+#
+# Optional secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN log the runner in to Docker Hub before the
+# application images are pulled. MiniStack pulls anonymously, so it relies on those images being in the
+# local cache once Docker Hub starts rate limiting it.
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - 'validation/**'
+      - '.github/workflows/fleet.yml'
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      total:
+        description: 'Deployments in the fleet (30 to 50 is the target)'
+        default: '30'
+      regions:
+        description: 'Comma-separated regions'
+        default: 'us-east-1,eu-west-1,ap-southeast-2'
+      accounts:
+        description: 'Comma-separated 12-digit account ids'
+        default: '000000000000,111111111111,222222222222'
+      core_ref:
+        description: 'cfc-core branch or tag to deploy with'
+        default: 'feat/ministack-1-5-support'
+      apps:
+        description: 'Comma-separated application ids from validation/fleet-apps.json (default: all)'
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fleet:
+    name: Fleet across accounts and regions
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      TOTAL: ${{ github.event_name == 'pull_request' && '9' || inputs.total || '30' }}
+      REGIONS: ${{ github.event_name == 'pull_request' && 'us-east-1,eu-west-1' || inputs.regions || 'us-east-1,eu-west-1,ap-southeast-2' }}
+      ACCOUNTS: ${{ github.event_name == 'pull_request' && '000000000000,111111111111' || inputs.accounts || '000000000000,111111111111,222222222222' }}
+      APPS: ${{ inputs.apps }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # The fleet deploys with the cfc-core build of a named ref, not the -SNAPSHOT on Central: every cfc-core
+      # pull request publishes to that one coordinate, so the latest snapshot is whichever branch published last.
+      # Once the MiniStack 1.5 work is on develop, change the default ref to develop.
+      - name: Check out cfc-core
+        uses: actions/checkout@v4
+        with:
+          repository: CloudForgeCI/cfc-core
+          ref: ${{ inputs.core_ref || 'feat/ministack-1-5-support' }}
+          path: cfc-core
+
+      - name: Build cloudforge-api from the cfc-core checkout
+        run: |
+          mvn -B -q -DskipTests install
+          mvn -B -q -f cfc-core/pom.xml -pl .,cloudforge-core,cloudforge-api -DskipTests install
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install the CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install the latest cloudforge-cli release
+        run: |
+          # Homebrew is preinstalled on this runner but not on PATH by default.
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install CloudForgeCI/tap/cloudforge-cli
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+
+      - name: Log in to Docker Hub
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull the application images
+        run: python3 validation/fleet.py --prefetch-images ${APPS:+--apps "$APPS"}
+
+      - name: Start MiniStack with this checkout's code
+        run: |
+          validation/run-from-source.sh com.cloudforgeci.cli.Main emulator start --target ministack
+          curl -fsS http://localhost:4566/_ministack/health
+
+      - name: Deploy, check and destroy the fleet
+        run: |
+          export FLEET_CLI="$PWD/validation/run-from-source.sh com.cloudforgeci.cli.Main"
+          export FLEET_RECONCILE_CMD="$PWD/validation/run-from-source.sh com.cloudforge.core.local.EmulatorEdgeCli reconcile"
+          python3 -u validation/fleet.py --total "$TOTAL" --regions "$REGIONS" --accounts "$ACCOUNTS" ${APPS:+--apps "$APPS"} \
+            --memory-budget-mb 5000 --out fleet-out
+
+      - name: Add the summary to the run
+        if: always()
+        run: |
+          if [ -f fleet-out/fleet-summary.md ]; then cat fleet-out/fleet-summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Collect emulator logs
+        if: always()
+        run: |
+          mkdir -p fleet-out
+          docker ps -a --format '{{.Names}}\t{{.Status}}' > fleet-out/containers.txt || true
+          docker logs --tail 2000 cfc-ministack > fleet-out/ministack.log 2>&1 || true
+          docker exec cfc-emulator-edge cat /etc/nginx/conf.d/cloudforge-apps.conf > fleet-out/edge-routes.conf 2>&1 || true
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-results
+          path: fleet-out

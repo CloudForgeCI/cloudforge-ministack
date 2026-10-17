@@ -1,15 +1,26 @@
 name: Publish to Maven Central
 
-# Builds, tests, and publishes this module -- SNAPSHOT or real release, whatever version the pom
-# currently carries. Version is never bumped here; sync-cfc-core-version.yml keeps it in lockstep
-# with cfc-core's own version, so a push here just publishes whatever that workflow last set.
+# Builds, tests, and publishes this module. Version is never bumped here; sync-cfc-core-version.yml
+# keeps it in lockstep with cfc-core's own version.
+#
+#   pull request   against develop, publishes the -SNAPSHOT version, so cfc-core and the other repos
+#                  can build against the change under review (as cfc-core's own pull requests do).
+#                  Pull requests from forks do not publish: they have no access to the secrets.
+#   push to develop  publishes the -SNAPSHOT version again after a merge. develop is the default
+#                  branch, as in cfc-core, and only ever publishes snapshots.
+#   push to main   publishes the release version. When the pom still carries a -SNAPSHOT version
+#                  nothing is published, because a release needs a released cfc-core parent, which
+#                  sync-cfc-core-version.yml adopts once cfc-core publishes one.
 #
 # Required repo secrets (same four cfc-core's own publish workflows use):
 #   GPG_PRIVATE_KEY, GPG_PASSPHRASE, CENTRAL_PORTAL_USERNAME, CENTRAL_PORTAL_PASSWORD
 
 on:
+  pull_request:
+    branches: [ develop ]
+    types: [ opened, synchronize, reopened ]
   push:
-    branches: [ main ]
+    branches: [ develop, main ]
   workflow_dispatch: {}
 
 jobs:
@@ -28,16 +39,64 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
+      # -DskipTests=false: the cfc-core parent pom defaults skipTests to true, and its published form
+      # has no -Pci profile to turn them back on, so without it this step builds without running them.
+      # The tests that need a running MiniStack are tagged ministack, which the pom excludes; fleet.yml covers them.
       - name: Build and test
-        run: mvn -B clean verify
+        run: mvn -B -DskipTests=false clean verify
+
+  mode:
+    name: Decide what to publish
+    runs-on: ubuntu-latest
+    needs: build-test
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Match the version to the trigger
+        id: decide
+        run: |
+          VERSION=$(mvn -q -pl . help:evaluate -Dexpression=project.version -DforceStdout)
+          publish=false
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+              echo "Pull request from a fork: no secrets, nothing published."
+            elif [[ "$VERSION" == *-SNAPSHOT ]]; then
+              publish=true
+            else
+              echo "::error::Version '$VERSION' is not a SNAPSHOT; pull requests publish snapshots only."
+              exit 1
+            fi
+          elif [ "${{ github.ref_name }}" = "develop" ]; then
+            if [[ "$VERSION" == *-SNAPSHOT ]]; then
+              publish=true
+            else
+              echo "Version '$VERSION' is a release: releases are published from main."
+            fi
+          elif [[ "$VERSION" == *-SNAPSHOT ]]; then
+            echo "Version '$VERSION' is a SNAPSHOT: nothing to release from this push."
+          else
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Sign and publish to Central
+    needs: [ build-test, mode ]
+    if: ${{ needs.mode.outputs.publish == 'true' }}
     # macOS, not Linux: on GitHub's Linux runners gpg-agent fails with "Too much data for IPC
     # layer" when signing -- same issue cfc-core's own publish workflows document. macOS runners
     # are not affected.
     runs-on: macos-latest
-    needs: build-test
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -93,6 +152,12 @@ jobs:
                 <id>central</id>
                 <username>${CENTRAL_PORTAL_USERNAME}</username>
                 <password>${CENTRAL_PORTAL_PASSWORD}</password>
+                <!-- Maven sends a server's credentials only to the origins of the repositories declared
+                     with the same id, and "central" is Maven Central. List the Central Portal origin so
+                     the credentials go to the snapshots repository and not to Maven Central. -->
+                <repositoryOrigins>
+                  <repositoryOrigin>https://central.sonatype.com</repositoryOrigin>
+                </repositoryOrigins>
               </server>
             </servers>
           </settings>
