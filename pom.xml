@@ -126,6 +126,9 @@
       </plugin>
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
+        <!-- Pinned: with 3.6.0, which the published cfc-core parent leaves to Maven's default, the
+             excludedGroups below no longer kept the tests that need a running MiniStack out of the build. -->
+        <version>3.5.4</version>
         <configuration>
           <excludedGroups>ministack</excludedGroups>
         </configuration>
