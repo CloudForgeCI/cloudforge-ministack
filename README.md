@@ -149,28 +149,34 @@ Application ports are not published on the host. The edge routes each hostname t
 
 ## Validation
 
-`validation/fleet.py` deploys a fleet of applications across regions, checks every one and tears the
+`validation/fleet.py` deploys a fleet of applications across accounts and regions, checks every one and tears the
 fleet down:
 
 ```bash
-python3 validation/fleet.py --regions us-east-1,eu-west-1,ap-southeast-2 --total 30
+python3 validation/fleet.py --regions us-east-1,eu-west-1,ap-southeast-2 \
+    --accounts 000000000000,111111111111,222222222222 --total 30
 ```
 
-The plan spreads `--total` deployments (30 to 50 is the target) over the regions and over the
+The plan spreads `--total` deployments (30 to 50 is the target) over the account and region pairs and over the
 applications in `validation/fleet-apps.json`. An application that appears twice in a region gets a
 subdomain per instance, so each deployment has its own edge hostname such as
-`jenkins-ue1-2.cloudforge.localhost`. The plan runs in waves that fit `--memory-budget-mb`. Each wave is
+`jenkins-ue1-a0-2.cloudforge.localhost`. The plan runs in waves that fit `--memory-budget-mb`. Each wave is
 deployed, checked and destroyed before the next begins.
 
-Per deployment it checks that the deploy completed in the planned region only, that the ECS service
+MiniStack gives each 12-digit access key its own account, so a deployment for account `111111111111` runs
+with that access key and names the account in its context's `account` field. Accounts other than
+`000000000000` have no placeholder hosted zone, so their contexts set `createZone: true`. Nothing in
+cfc-core changes for accounts.
+
+Per deployment it checks that the deploy completed in the planned account and region only, that the ECS service
 reached its desired count, and that an http application answers on its own hostname with a status below
-500. Per wave it checks that each region holds exactly the stacks planned for it, and after the destroy
+500. Per wave it checks that each account and region holds exactly the stacks planned for it, and after the destroy
 that no stack, ECS task or database container is left. Results go to `fleet-out/fleet-results.json` and
 `fleet-summary.md`, and the exit status is 1 when anything fails.
 
-Needs the AWS CLI and the CDK CLI, and regions are bootstrapped with `cdk bootstrap` when missing. The
-`MiniStack fleet` workflow runs it: a nine deployment smoke on pull requests that touch the deployer or
-the fleet, the full 30 deployment fleet every Monday, and any size up to 50 on demand.
+Needs the AWS CLI and the CDK CLI, and each account and region is bootstrapped with `cdk bootstrap` when missing. The
+`MiniStack fleet` workflow runs it: a nine deployment smoke over two accounts and two regions on pull requests that touch the deployer or
+the fleet, the full 30 deployment fleet over three accounts and three regions every Monday, and any size up to 50 on demand.
 `validation/run-from-source.sh` runs the installed CLI with this checkout's code, so the workflow tests
 the change under review, and `--only-waves 3` reruns a single wave of a plan to reproduce a failure.
 

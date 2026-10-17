@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """Deploys a fleet of applications to MiniStack across regions, checks each one, and tears it down.
 
-    python3 validation/fleet.py --regions us-east-1,eu-west-1,ap-southeast-2 --total 30
+    python3 validation/fleet.py --regions us-east-1,eu-west-1,ap-southeast-2 \
+        --accounts 000000000000,111111111111,222222222222 --total 30
 
-The fleet is a plan of N deployments spread round-robin over the regions and over the applications in
-fleet-apps.json. An application that appears more than once in a region gets a subdomain per instance,
+The fleet is a plan of N deployments spread round-robin over the account and region pairs and over the
+applications in fleet-apps.json. MiniStack gives each 12-digit access key its own account, so every
+deployment runs with AWS_ACCESS_KEY_ID set to its account and names it in its context's account field. An application that appears more than once in a region gets a subdomain per instance,
 so every deployment has its own hostname (for example jenkins-ue1-2.cloudforge.localhost). The plan is
 split into waves that fit --memory-budget-mb; each wave is deployed, checked, destroyed and checked
 again before the next one starts, so a long plan never needs more memory than one wave.
 
 For every deployment the run checks that
-  - the deploy completed, in the region the plan chose and in no other,
+  - the deploy completed, in the account and region the plan chose and in no other,
   - the ECS service reached its desired count,
   - an http application answers on its own edge hostname with a status below 500,
 and for every wave that
-  - each region holds exactly the stacks planned for it,
+  - each account and region holds exactly the stacks planned for it,
   - after the destroy no stack, ECS task or database container is left.
 
 Requires MiniStack on localhost:4566 (cloudforge-cli emulator start --target ministack), the AWS CLI and
 the CDK CLI on PATH, a CloudForge CLI (FLEET_CLI, default cloudforge-cli) and a way to reconcile the emulator
-edge (FLEET_RECONCILE_CMD, default scripts/emulator-edge-reconcile.sh). Regions are bootstrapped with `cdk bootstrap` when missing.
+edge (FLEET_RECONCILE_CMD, default scripts/emulator-edge-reconcile.sh). Each account and region is bootstrapped with `cdk bootstrap` when missing.
 Writes fleet-results.json and fleet-summary.md to --out and exits 1 when any check fails.
 """
 import argparse
@@ -37,12 +39,17 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ENDPOINT = os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566")
-ACCOUNT = "000000000000"
+DEFAULT_ACCOUNT = "000000000000"
 DOMAIN = "example.com"
 ENV = {**os.environ, "AWS_ENDPOINT_URL": ENDPOINT, "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
 ENV.pop("AWS_PROFILE", None)
 ENV.pop("CFC_DEPLOYING", None)
 ENV.pop("CFC_MINISTACK_REPLACE_SAME_APP", None)
+
+
+def env_for(account):
+    """The environment of a process acting in `account`: MiniStack reads the account from the access key."""
+    return {**ENV, "AWS_ACCESS_KEY_ID": account if account != DEFAULT_ACCOUNT else "test"}
 
 
 def region_abbreviation(region):
@@ -51,20 +58,23 @@ def region_abbreviation(region):
     return "".join(part[0] for part in parts[:-1]) + parts[-1]
 
 
-def build_plan(apps, regions, total):
-    """Spreads `total` deployments over the regions first, then over the applications."""
+def build_plan(apps, regions, accounts, total):
+    """Spreads `total` deployments over the account and region pairs first, then over the applications."""
+    pairs = [(account, region) for region in regions for account in accounts]
     seen = {}
     plan = []
     for index in range(total):
-        region = regions[index % len(regions)]
-        app = apps[(index // len(regions)) % len(apps)]
-        instance = seen.get((app["id"], region), 0) + 1
-        seen[(app["id"], region)] = instance
-        label = f"{app['id']}-{region_abbreviation(region)}-{instance}"
+        account, region = pairs[index % len(pairs)]
+        app = apps[(index // len(pairs)) % len(apps)]
+        key = (app["id"], account, region)
+        instance = seen.get(key, 0) + 1
+        seen[key] = instance
+        label = f"{app['id']}-{region_abbreviation(region)}-a{accounts.index(account)}-{instance}"
         plan.append({
-            "app": app["id"], "region": region, "instance": instance, "hostname": f"{label}.cloudforge.localhost",
-            "stackName": f"Fleet-{label}", "memoryMb": app["memoryMb"], "expect": app.get("expect", "http"),
-            "path": app.get("path", "/"), "database": bool(app.get("database")), "subdomain": label,
+            "app": app["id"], "account": account, "region": region, "instance": instance,
+            "hostname": f"{label}.cloudforge.localhost", "stackName": f"Fleet-{label}",
+            "memoryMb": app["memoryMb"], "expect": app.get("expect", "http"), "path": app.get("path", "/"),
+            "database": bool(app.get("database")), "subdomain": label,
         })
     return plan
 
@@ -86,18 +96,21 @@ def context_for(item):
     context = {
         "stackName": item["stackName"], "applicationId": item["app"], "applicationName": item["app"],
         "environment": "development", "runtime": "FARGATE", "authMode": "none",
-        "region": item["region"], "domain": DOMAIN, "subdomain": item["subdomain"], "createZone": False,
+        "region": item["region"], "account": item["account"], "domain": DOMAIN, "subdomain": item["subdomain"],
+        # An account other than the default has no placeholder hosted zone, so synthesis would look the
+        # zone up in real Route 53. Creating the zone in the emulator avoids that lookup.
+        "createZone": item["account"] != DEFAULT_ACCOUNT,
     }
     if item["database"]:
         context["provisionDatabase"] = True
     return context
 
 
-def aws(region, *args, timeout=60):
-    """Runs the AWS CLI against the emulator in `region`; returns parsed JSON or None."""
+def aws(account, region, *args, timeout=60):
+    """Runs the AWS CLI against the emulator as `account` in `region`; returns parsed JSON or None."""
     try:
         result = subprocess.run(["aws", "--endpoint-url", ENDPOINT, "--region", region, *args, "--output", "json"],
-                                capture_output=True, text=True, env=ENV, timeout=timeout)
+                                capture_output=True, text=True, env=env_for(account), timeout=timeout)
     except subprocess.TimeoutExpired:
         return None
     if result.returncode != 0 or not result.stdout.strip():
@@ -108,20 +121,21 @@ def aws(region, *args, timeout=60):
         return None
 
 
-def ensure_bootstrapped(region):
-    parameter = aws(region, "ssm", "get-parameter", "--name", "/cdk-bootstrap/hnb659fds/version")
+def ensure_bootstrapped(account, region):
+    parameter = aws(account, region, "ssm", "get-parameter", "--name", "/cdk-bootstrap/hnb659fds/version")
     if parameter:
         return
-    print(f"bootstrapping {region}", flush=True)
-    subprocess.run(["cdk", "bootstrap", f"aws://{ACCOUNT}/{region}"], env={**ENV, "AWS_DEFAULT_REGION": region},
+    print(f"bootstrapping {account} in {region}", flush=True)
+    subprocess.run(["cdk", "bootstrap", f"aws://{account}/{region}"],
+                   env={**env_for(account), "AWS_DEFAULT_REGION": region},
                    capture_output=True, text=True, timeout=600, check=True)
 
 
-def run_cli(verb, context_file, timeout):
+def run_cli(verb, context_file, timeout, account):
     try:
         result = subprocess.run([*shlex.split(os.environ.get("FLEET_CLI", "cloudforge-cli")), verb,
                                  "--context", str(context_file), "--target", "ministack"],
-                                capture_output=True, text=True, env=ENV, timeout=timeout)
+                                capture_output=True, text=True, env=env_for(account), timeout=timeout)
         return result.returncode, result.stdout
     except subprocess.TimeoutExpired:
         return 124, ""
@@ -139,8 +153,8 @@ def last_phase_status(output, phase):
     return status or {}
 
 
-def stacks_in(region):
-    data = aws(region, "cloudformation", "list-stacks") or {}
+def stacks_in(account, region):
+    data = aws(account, region, "cloudformation", "list-stacks") or {}
     return {s["StackName"]: s["StackStatus"] for s in data.get("StackSummaries", [])
             if s["StackStatus"] != "DELETE_COMPLETE" and s["StackName"].startswith("Fleet-")}
 
@@ -149,7 +163,7 @@ def deploy_one(item, work, timeout):
     context_file = work / f"{item['stackName']}.json"
     context_file.write_text(json.dumps(context_for(item), indent=2))
     started = time.time()
-    code, output = run_cli("deploy", context_file, timeout)
+    code, output = run_cli("deploy", context_file, timeout, item["account"])
     final = last_phase_status(output, "deploy")
     item["deployed"] = final.get("status") == "complete"
     item["deploySeconds"] = round(time.time() - started)
@@ -160,14 +174,14 @@ def deploy_one(item, work, timeout):
 
 def service_counts(item):
     """(running, desired) of the stack's ECS service in its own region, or None when it is not found."""
-    clusters = (aws(item["region"], "ecs", "list-clusters") or {}).get("clusterArns", [])
+    clusters = (aws(item["account"], item["region"], "ecs", "list-clusters") or {}).get("clusterArns", [])
     for cluster in clusters:
         if item["stackName"] not in cluster:
             continue
-        services = (aws(item["region"], "ecs", "list-services", "--cluster", cluster) or {}).get("serviceArns", [])
+        services = (aws(item["account"], item["region"], "ecs", "list-services", "--cluster", cluster) or {}).get("serviceArns", [])
         if not services:
             continue
-        described = (aws(item["region"], "ecs", "describe-services", "--cluster", cluster, "--services", *services)
+        described = (aws(item["account"], item["region"], "ecs", "describe-services", "--cluster", cluster, "--services", *services)
                      or {}).get("services", [])
         if described:
             return described[0].get("runningCount", 0), described[0].get("desiredCount", 0)
@@ -217,19 +231,21 @@ def check_wave(wave, reconcile_command, settle_seconds):
             reconcile_edge(reconcile_command)
 
 
-def check_regions(wave, regions):
-    """Each region must hold exactly the stacks the wave planned for it."""
+def check_regions(wave, pairs):
+    """Each account and region must hold exactly the stacks the wave planned for it."""
     problems = []
-    for region in regions:
-        expected = {item["stackName"] + "-ministack" for item in wave if item["region"] == region and item["deployed"]}
-        actual = set(stacks_in(region))
+    for account, region in pairs:
+        expected = {item["stackName"] + "-ministack" for item in wave
+                    if item["account"] == account and item["region"] == region and item["deployed"]}
+        actual = set(stacks_in(account, region))
         if actual != expected:
-            problems.append({"region": region, "missing": sorted(expected - actual), "unexpected": sorted(actual - expected)})
+            problems.append({"account": account, "region": region,
+                             "missing": sorted(expected - actual), "unexpected": sorted(actual - expected)})
     return problems
 
 
 def destroy_one(item, work, timeout):
-    code, output = run_cli("destroy", work / f"{item['stackName']}.json", timeout)
+    code, output = run_cli("destroy", work / f"{item['stackName']}.json", timeout, item["account"])
     item["destroyed"] = last_phase_status(output, "destroy").get("status") == "complete"
     return item
 
@@ -261,6 +277,8 @@ def verdict(item):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--regions", default="us-east-1,eu-west-1,ap-southeast-2")
+    parser.add_argument("--accounts", default=DEFAULT_ACCOUNT,
+                        help="comma-separated 12-digit account ids; MiniStack reads the account from the access key")
     parser.add_argument("--total", type=int, default=30, help="deployments in the whole plan (30 to 50 is the target)")
     parser.add_argument("--apps", help="comma-separated application ids from fleet-apps.json (default: all)")
     parser.add_argument("--memory-budget-mb", type=int, default=6000, help="memory one wave may use")
@@ -276,13 +294,18 @@ def main():
     args = parser.parse_args()
 
     regions = args.regions.split(",")
+    accounts = args.accounts.split(",")
+    for account in accounts:
+        if not (len(account) == 12 and account.isdigit()):
+            parser.error(f"account {account!r} is not 12 digits")
+    pairs = [(account, region) for region in regions for account in accounts]
     apps = json.loads((HERE / "fleet-apps.json").read_text())["apps"]
     if args.apps:
         wanted = args.apps.split(",")
         apps = [app for app in apps if app["id"] in wanted]
-    plan = build_plan(apps, regions, args.total)
+    plan = build_plan(apps, regions, accounts, args.total)
     waves = split_into_waves(plan, args.memory_budget_mb, args.max_wave)
-    print(f"{len(plan)} deployments, {len(regions)} regions, {len(waves)} waves", flush=True)
+    print(f"{len(plan)} deployments, {len(accounts)} accounts, {len(regions)} regions, {len(waves)} waves", flush=True)
     selected = {int(n) for n in args.only_waves.split(",")} if args.only_waves else None
     if args.prefetch_images:
         images = sorted({image for app in apps for image in app.get("images", [])})
@@ -299,14 +322,14 @@ def main():
     if args.plan_only:
         for number, wave in enumerate(waves, 1):
             print(f"wave {number} ({sum(i['memoryMb'] for i in wave)} MB): "
-                  + ", ".join(f"{i['stackName']}@{i['region']}" for i in wave))
+                  + ", ".join(f"{i['stackName']}@{i['account']}/{i['region']}" for i in wave))
         return 0
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     reconcile_command = os.environ.get("FLEET_RECONCILE_CMD", str(HERE.parent / "scripts" / "emulator-edge-reconcile.sh"))
-    for region in regions:
-        ensure_bootstrapped(region)
+    for account, region in pairs:
+        ensure_bootstrapped(account, region)
 
     results, wave_problems = [], []
     with tempfile.TemporaryDirectory() as temp:
@@ -319,7 +342,7 @@ def main():
             with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
                 list(pool.map(lambda item: deploy_one(item, work, args.deploy_timeout), wave))
             check_wave(wave, reconcile_command, args.settle_seconds)
-            regional = check_regions(wave, regions)
+            regional = check_regions(wave, pairs)
             if regional:
                 wave_problems.append({"wave": number, "stage": "deployed", "regions": regional})
             if args.keep and number == (max(selected) if selected else len(waves)):
@@ -327,7 +350,8 @@ def main():
                 break
             with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
                 list(pool.map(lambda item: destroy_one(item, work, args.deploy_timeout), wave))
-            leftovers = {region: sorted(stacks_in(region)) for region in regions if stacks_in(region)}
+            leftovers = {f"{account}/{region}": sorted(stacks_in(account, region))
+                         for account, region in pairs if stacks_in(account, region)}
             containers = leaked_containers()
             if leftovers or containers:
                 wave_problems.append({"wave": number, "stage": "destroyed", "stacks": leftovers, "containers": containers})
@@ -339,10 +363,10 @@ def main():
     failed = [item for item in results if verdict(item)]
     (out / "fleet-results.json").write_text(json.dumps({"plan": results, "waveProblems": wave_problems}, indent=2))
     lines = [f"# MiniStack fleet: {len(results) - len(failed)}/{len(results)} deployments passed", "",
-             f"Regions: {', '.join(regions)}. Waves: {len(waves)}.", "",
-             "| stack | region | app | deploy | ECS | http | notes |", "|---|---|---|---|---|---|---|"]
+             f"Accounts: {', '.join(accounts)}. Regions: {', '.join(regions)}. Waves: {len(waves)}.", "",
+             "| stack | account | region | app | deploy | ECS | http | notes |", "|---|---|---|---|---|---|---|---|"]
     for item in results:
-        lines.append(f"| {item['stackName']} | {item['region']} | {item['app']} | "
+        lines.append(f"| {item['stackName']} | {item['account']} | {item['region']} | {item['app']} | "
                      f"{'ok' if item['deployed'] else 'FAILED'} ({item.get('deploySeconds', '-')}s) | "
                      f"{'running' if item['ecsRunning'] else 'not running'} | {item.get('httpStatus', '-')} | "
                      f"{'; '.join(verdict(item))} |")

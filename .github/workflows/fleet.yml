@@ -1,13 +1,16 @@
 name: MiniStack fleet
 
-# Deploys a fleet of applications to MiniStack across several regions, checks every one, destroys
+# Deploys a fleet of applications to MiniStack across several accounts and regions, checks every one, destroys
 # them and checks that nothing is left (validation/fleet.py). The fleet is split into waves that fit
 # the runner's memory, so a plan of 30 to 50 deployments runs in a few waves.
 #
-#   pull request   a nine deployment smoke across three regions, when the adapter, deployer or the
-#                  fleet itself changes
-#   schedule       the full 30 deployment fleet every Monday
-#   dispatch       any size up to 50, any regions
+#   pull request   a nine deployment smoke across two accounts and two regions, when the adapter,
+#                  deployer or the fleet itself changes
+#   schedule       the full 30 deployment fleet across three accounts and three regions every Monday
+#   dispatch       any size up to 50, any accounts and regions
+#
+# MiniStack gives each 12-digit access key its own account, so the fleet runs each deployment with
+# AWS_ACCESS_KEY_ID set to the account it targets.
 #
 # Optional secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN log the runner in to Docker Hub before the
 # application images are pulled. MiniStack pulls anonymously, so it relies on those images being in the
@@ -30,6 +33,9 @@ on:
       regions:
         description: 'Comma-separated regions'
         default: 'us-east-1,eu-west-1,ap-southeast-2'
+      accounts:
+        description: 'Comma-separated 12-digit account ids'
+        default: '000000000000,111111111111,222222222222'
       apps:
         description: 'Comma-separated application ids from validation/fleet-apps.json (default: all)'
         default: ''
@@ -43,12 +49,13 @@ concurrency:
 
 jobs:
   fleet:
-    name: Fleet across regions
+    name: Fleet across accounts and regions
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
       TOTAL: ${{ github.event_name == 'pull_request' && '9' || inputs.total || '30' }}
-      REGIONS: ${{ inputs.regions || 'us-east-1,eu-west-1,ap-southeast-2' }}
+      REGIONS: ${{ github.event_name == 'pull_request' && 'us-east-1,eu-west-1' || inputs.regions || 'us-east-1,eu-west-1,ap-southeast-2' }}
+      ACCOUNTS: ${{ github.event_name == 'pull_request' && '000000000000,111111111111' || inputs.accounts || '000000000000,111111111111,222222222222' }}
       APPS: ${{ inputs.apps }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       AWS_ENDPOINT_URL: http://localhost:4566
@@ -100,7 +107,7 @@ jobs:
         run: |
           export FLEET_CLI="$PWD/validation/run-from-source.sh com.cloudforgeci.cli.Main"
           export FLEET_RECONCILE_CMD="$PWD/validation/run-from-source.sh com.cloudforge.core.local.EmulatorEdgeCli reconcile"
-          python3 -u validation/fleet.py --total "$TOTAL" --regions "$REGIONS" ${APPS:+--apps "$APPS"} \
+          python3 -u validation/fleet.py --total "$TOTAL" --regions "$REGIONS" --accounts "$ACCOUNTS" ${APPS:+--apps "$APPS"} \
             --memory-budget-mb 5000 --out fleet-out
 
       - name: Add the summary to the run
