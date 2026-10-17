@@ -258,6 +258,22 @@ def leaked_containers():
                   if name.startswith(("ministack-ecs-", "ministack-rds-")))
 
 
+def container_diagnostics(names):
+    """Why the leaked containers stopped: the exit code, OOM flag and last log lines of one container per stack."""
+    by_stack = {}
+    for name in names:
+        by_stack.setdefault(name.split("-", 3)[-1], name)
+    report = {}
+    for stack, name in sorted(by_stack.items()):
+        state = subprocess.run(["docker", "inspect", "--format",
+                                "exit={{.State.ExitCode}} oomKilled={{.State.OOMKilled}} error={{.State.Error}}", name],
+                               capture_output=True, text=True).stdout.strip()
+        logs = subprocess.run(["docker", "logs", "--tail", "15", name], capture_output=True, text=True)
+        report[stack] = {"count": sum(1 for n in names if n.endswith(stack)), "state": state,
+                         "lastLines": (logs.stdout + logs.stderr).strip().splitlines()[-15:]}
+    return report
+
+
 def remove_containers(names):
     if names:
         subprocess.run(["docker", "rm", "-f", *names], capture_output=True, text=True)
@@ -356,7 +372,9 @@ def main():
                          for account, region in pairs if stacks_in(account, region)}
             containers = leaked_containers()
             if leftovers or containers:
-                wave_problems.append({"wave": number, "stage": "destroyed", "stacks": leftovers, "containers": containers})
+                wave_problems.append({"wave": number, "stage": "destroyed", "stacks": leftovers,
+                                      "containerCount": len(containers),
+                                      "containers": container_diagnostics(containers)})
                 remove_containers(containers)
             results.extend(wave)
             print(f"wave {number}: {sum(1 for i in wave if not verdict(i))}/{len(wave)} passed "
@@ -364,7 +382,10 @@ def main():
 
     failed = [item for item in results if verdict(item)]
     (out / "fleet-results.json").write_text(json.dumps({"plan": results, "waveProblems": wave_problems}, indent=2))
-    lines = [f"# MiniStack fleet: {len(results) - len(failed)}/{len(results)} deployments passed", "",
+    headline = f"{len(results) - len(failed)}/{len(results)} deployments passed"
+    if wave_problems:
+        headline += f", {len(wave_problems)} wave problem{'s' if len(wave_problems) != 1 else ''}"
+    lines = [f"# MiniStack fleet: {headline}", "",
              f"Accounts: {', '.join(accounts)}. Regions: {', '.join(regions)}. Waves: {len(waves)}.", "",
              "| stack | account | region | app | deploy | ECS | http | notes |", "|---|---|---|---|---|---|---|---|"]
     for item in results:
