@@ -12,6 +12,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.nio.charset.StandardCharsets;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 import software.amazon.awssdk.services.cloudformation.model.Capability;
@@ -31,6 +32,9 @@ import software.amazon.awssdk.services.cloudformation.model.Output;
 import software.amazon.awssdk.services.cloudformation.model.ResourceChange;
 import software.amazon.awssdk.services.cloudformation.model.StackSummary;
 import software.amazon.awssdk.services.cloudformation.model.Tag;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.BucketAlreadyExistsException;
+import software.amazon.awssdk.services.s3.model.BucketAlreadyOwnedByYouException;
 import software.amazon.awssdk.services.ssm.SsmClient;
 import software.amazon.awssdk.services.ssm.model.ParameterNotFoundException;
 
@@ -116,21 +120,39 @@ public final class MiniStackDeployer implements LocalDeployer {
             .build();
     }
 
-    /** CloudFormation rejects an inline template body over this many bytes; larger ones need S3. */
+    /** CloudFormation rejects an inline template body over this many bytes; larger ones are uploaded to S3. */
     static final int MAX_INLINE_TEMPLATE_BYTES = 51_200;
 
-    /**
-     * The template without the whitespace CDK pretty-prints it with, which is more than half its size.
-     * Fails with an explanation when it is still too large to send inline.
-     */
+    /** The template without the whitespace CDK pretty-prints it with, which is more than half its size. */
     static String compact(String templateBody) throws IOException {
-        String compact = MAPPER.writeValueAsString(MAPPER.readTree(templateBody));
-        int bytes = compact.getBytes(StandardCharsets.UTF_8).length;
-        if (bytes > MAX_INLINE_TEMPLATE_BYTES) {
-            throw new IOException("The template is " + bytes + " bytes, over the " + MAX_INLINE_TEMPLATE_BYTES
-                + "-byte limit CloudFormation accepts inline. Real AWS needs it uploaded to S3 as well.");
+        return MAPPER.writeValueAsString(MAPPER.readTree(templateBody));
+    }
+
+    static boolean fitsInline(String templateBody) {
+        return templateBody.getBytes(StandardCharsets.UTF_8).length <= MAX_INLINE_TEMPLATE_BYTES;
+    }
+
+    /**
+     * Uploads a template too large to send inline to a bucket in MiniStack's S3, as CloudFormation requires of
+     * real AWS, and returns the URL the stack is created from.
+     */
+    private String uploadTemplate(String stackName, String templateBody) {
+        String bucket = "cfc-ministack-templates-" + region;
+        try (S3Client s3 = S3Client.builder()
+                .endpointOverride(URI.create(endpoint))
+                .region(Region.of(region))
+                .forcePathStyle(true)
+                .credentialsProvider(credentials)
+                .build()) {
+            try {
+                s3.createBucket(request -> request.bucket(bucket));
+            } catch (BucketAlreadyOwnedByYouException | BucketAlreadyExistsException e) {
+                // Left from an earlier deploy.
+            }
+            String key = stackName + "-" + UUID.randomUUID().toString().substring(0, 8) + ".json";
+            s3.putObject(request -> request.bucket(bucket).key(key), RequestBody.fromString(templateBody));
+            return endpoint + "/" + bucket + "/" + key;
         }
-        return compact;
     }
 
     /**
@@ -193,13 +215,17 @@ public final class MiniStackDeployer implements LocalDeployer {
         }
         String changeSetName = "cfc-" + UUID.randomUUID().toString().substring(0, 8);
 
-        cloudFormation.createChangeSet(CreateChangeSetRequest.builder()
+        var changeSetRequest = CreateChangeSetRequest.builder()
             .stackName(stackName)
             .changeSetName(changeSetName)
             .changeSetType(exists ? ChangeSetType.UPDATE : ChangeSetType.CREATE)
-            .templateBody(templateBody)
-            .capabilities(Capability.CAPABILITY_IAM, Capability.CAPABILITY_NAMED_IAM)
-            .build());
+            .capabilities(Capability.CAPABILITY_IAM, Capability.CAPABILITY_NAMED_IAM);
+        if (fitsInline(templateBody)) {
+            changeSetRequest.templateBody(templateBody);
+        } else {
+            changeSetRequest.templateURL(uploadTemplate(stackName, templateBody));
+        }
+        cloudFormation.createChangeSet(changeSetRequest.build());
 
         var changeSet = waitForChangeSet(stackName, changeSetName);
         if (changeSet.status() == ChangeSetStatus.FAILED) {
