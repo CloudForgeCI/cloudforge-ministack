@@ -43,8 +43,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Live MiniStack API assertions for security-group <em>rule records</em>,
  * Route53 alias → ALB wiring, ALB/listener inventory, and ACM presence.
  *
- * <p>Does <strong>not</strong> claim packet-filter enforcement or ALB→ECS forward
- * (MiniStack adapts forwards to localhost redirect when an ECS service is present).</p>
+ * <p>Does <strong>not</strong> claim packet-filter enforcement. MiniStack 1.5 forwards an ALB listener to an ECS
+ * service itself; before that the adapter redirected the listener to the task's port on localhost.</p>
  */
 @Tag("ministack")
 @Tag("integration")
@@ -146,7 +146,7 @@ class MiniStackNativeNetworkVerificationTest {
                 assertFalse(ministack.acm().listCertificates().certificateSummaryList().isEmpty(),
                     "ACM should list at least one certificate after TLS resources deploy");
 
-                assertReachable(output(ministack, stackName, "MiniStackLocalUrl"));
+                assertReachable(ministack.reachable(output(ministack, stackName, "MiniStackLocalUrl")));
             } finally {
                 deleteQuietly(ministack, stackName);
             }
@@ -154,7 +154,7 @@ class MiniStackNativeNetworkVerificationTest {
     }
 
     @Test
-    void adaptedListenerRedirectsEcsForwardToLocalhostPort() throws Exception {
+    void adaptedListenerKeepsTheEcsForwardOnMiniStack15() throws Exception {
         ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
             {
               "AWSTemplateFormatVersion":"2010-09-09",
@@ -200,11 +200,10 @@ class MiniStackNativeNetworkVerificationTest {
             .path("Resources").path("Listener").path("Properties").path("DefaultActions");
         assertTrue(actions.isArray() && !actions.isEmpty());
         JsonNode action = actions.get(0);
-        assertEquals("redirect", action.path("Type").asText());
-        assertEquals("localhost", action.path("RedirectConfig").path("Host").asText());
-        assertEquals("8080", action.path("RedirectConfig").path("Port").asText());
+        assertEquals("forward", action.path("Type").asText());
+        assertTrue(action.has("TargetGroupArn"));
         assertTrue(result.adaptations().stream()
-            .anyMatch(a -> a.reason().contains("cannot forward to ECS")));
+            .noneMatch(a -> a.reason().contains("cannot forward to ECS")));
     }
 
     private static ObjectNode networkTemplate(String lbName) throws Exception {

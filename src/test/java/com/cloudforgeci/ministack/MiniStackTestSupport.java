@@ -1,5 +1,6 @@
 package com.cloudforgeci.ministack;
 
+import com.cloudforge.core.local.LocalEmulatorSpec;
 import org.testcontainers.containers.BindMode;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
@@ -17,7 +18,7 @@ import java.net.URI;
 import java.time.Duration;
 
 final class MiniStackTestSupport implements AutoCloseable {
-    static final DockerImageName IMAGE = DockerImageName.parse("ministackorg/ministack:1.4.9");
+    static final DockerImageName IMAGE = DockerImageName.parse(LocalEmulatorSpec.ministack().image());
 
     private final GenericContainer<?> container;
     private URI endpoint;
@@ -61,6 +62,14 @@ final class MiniStackTestSupport implements AutoCloseable {
             .endpointOverride(endpoint).credentialsProvider(credentials).region(Region.US_EAST_1).build();
         acm = AcmClient.builder()
             .endpointOverride(endpoint).credentialsProvider(credentials).region(Region.US_EAST_1).build();
+    }
+
+    /**
+     * The URL in a stack output reached through this test's MiniStack. Outputs name the conventional port 4566,
+     * but a container Testcontainers starts is mapped to another one.
+     */
+    String reachable(String outputUrl) {
+        return outputUrl.replaceFirst("^http://localhost:4566", endpoint.toString());
     }
 
     CloudFormationClient cloudFormation() {
