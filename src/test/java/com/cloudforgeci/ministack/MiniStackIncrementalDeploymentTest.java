@@ -45,7 +45,7 @@ class MiniStackIncrementalDeploymentTest {
                     "AWS::EC2::VPC",
                     "AWS::ElasticLoadBalancingV2::LoadBalancer",
                     "AWS::ElasticLoadBalancingV2::Listener");
-                assertReachable(output(ministack, stackName, "MiniStackLocalUrl"));
+                assertReachable(ministack.reachable(output(ministack, stackName, "MiniStackLocalUrl")));
 
                 ObjectNode domain = template(true, null, false, false);
                 update(ministack, stackName, domain);
@@ -71,7 +71,7 @@ class MiniStackIncrementalDeploymentTest {
 
                 update(ministack, stackName, loadBalancerOnly);
                 assertFalse(resourceTypes(ministack, stackName).contains("AWS::Route53::HostedZone"));
-                assertReachable(output(ministack, stackName, "MiniStackLocalUrl"));
+                assertReachable(ministack.reachable(output(ministack, stackName, "MiniStackLocalUrl")));
             } finally {
                 try {
                     ministack.cloudFormation().deleteStack(
