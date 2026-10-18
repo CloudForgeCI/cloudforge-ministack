@@ -1,6 +1,7 @@
 package com.cloudforgeci.ministack;
 
 import com.cloudforge.core.local.LocalSameApplicationStackReplacer;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -114,5 +115,23 @@ class MiniStackDeployerLifecycleTest {
         Path volume = temp.resolve("Stack").resolve("jenkinsHome");
         MiniStackTemplateAdapter.createVolumeDirectory(volume);
         assertEquals("rwxrwxrwx", PosixFilePermissions.toString(Files.getPosixFilePermissions(volume)));
+    }
+
+    @Test
+    void containersOfANonDefaultAccountGetThatAccountsAccessKey() throws Exception {
+        String template = """
+            {"Resources":{"Task":{"Type":"AWS::ECS::TaskDefinition","Properties":{"ContainerDefinitions":[
+              {"Name":"app","Environment":[{"Name":"AWS_SECRET_ACCESS_KEY","Value":"kept"}]},
+              {"Name":"sidecar"}]}}}}""";
+
+        var pinned = new ObjectMapper().readTree(
+            MiniStackDeployer.pinTasksToAccount(template, "111111111111"));
+
+        var app = pinned.path("Resources").path("Task").path("Properties").path("ContainerDefinitions").get(0);
+        assertEquals("111111111111", app.path("Environment").get(1).path("Value").asText());
+        assertEquals("kept", app.path("Environment").get(0).path("Value").asText());
+        var sidecar = pinned.path("Resources").path("Task").path("Properties").path("ContainerDefinitions").get(1);
+        assertEquals("111111111111", sidecar.path("Environment").get(0).path("Value").asText());
+        assertEquals(template, MiniStackDeployer.pinTasksToAccount(template, "000000000000"));
     }
 }
