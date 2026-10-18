@@ -2,6 +2,7 @@ package com.cloudforgeci.ministack;
 
 import com.cloudforge.core.local.LocalEmulatorDefaults;
 import com.cloudforge.core.local.LocalEmulatorSpec;
+import com.cloudforge.core.local.MiniStackCfnResourceCatalog;
 import com.cloudforge.core.local.TemplateAdaptation;
 import com.cloudforge.core.local.TemplateAdaptationResult;
 import com.cloudforge.core.local.TemplateAdapter;
@@ -94,6 +95,7 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         List<TemplateAdaptation> adaptations = new ArrayList<>();
         removeUnsupportedApplicationAutoScaling(local, adaptations);
         removeLogRetentionCustomResources(local, adaptations);
+        removeComplianceResourcesMiniStackCannotCreate(local, adaptations);
         replacePrivateCertificateAuthorityWithPlainHttp(local, adaptations);
         moveUnsupportedCognitoResourcesToMetadata(local, adaptations);
         markManagerAsLocalEmulatorTarget(local, adaptations);
@@ -135,6 +137,73 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
 
         addLocalUrlOutput(local, adaptations, authenticationEnabled);
         return new TemplateAdaptationResult(local, List.copyOf(adaptations));
+    }
+
+    /**
+     * Removes the compliance resources MiniStack cannot create (a CloudTrail trail, a GuardDuty detector, a backup
+     * selection, Config rules and the web ACL association and logging), so an application with a production security
+     * profile deploys without those controls instead of being refused. Nothing in the template may still refer to a
+     * removed resource: the deploy fails with the names if something does, rather than leaving a dangling reference.
+     */
+    private static void removeComplianceResourcesMiniStackCannotCreate(
+            ObjectNode template,
+            List<TemplateAdaptation> adaptations) {
+        ObjectNode resources = asObject(template.get("Resources"));
+        if (resources == null) {
+            return;
+        }
+        List<String> remove = new ArrayList<>();
+        resources.properties().forEach(entry -> {
+            if (MiniStackCfnResourceCatalog.REMOVED_COMPLIANCE_TYPES.contains(entry.getValue().path("Type").asText())) {
+                remove.add(entry.getKey());
+            }
+        });
+        if (remove.isEmpty()) {
+            return;
+        }
+        for (String key : remove) {
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + key,
+                "MiniStack cannot create " + resources.get(key).path("Type").asText()
+                    + "; the control is not applied locally",
+                resources.get(key).deepCopy()));
+            resources.remove(key);
+        }
+        // A custom resource that only records an attribute of a removed resource, such as the trail's ARN in
+        // SSM, has nothing left to read, and MiniStack does not run the Lambda behind it anyway.
+        boolean cascaded = true;
+        while (cascaded) {
+            cascaded = false;
+            for (var entry : List.copyOf(resources.properties())) {
+                String type = entry.getValue().path("Type").asText();
+                if (("AWS::CloudFormation::CustomResource".equals(type) || type.startsWith("Custom::"))
+                        && referencesAny(entry.getValue(), remove)) {
+                    adaptations.add(new TemplateAdaptation(
+                        "Resources." + entry.getKey(),
+                        "It reads a resource MiniStack cannot create, so it is removed with it",
+                        entry.getValue().deepCopy()));
+                    resources.remove(entry.getKey());
+                    remove.add(entry.getKey());
+                    cascaded = true;
+                }
+            }
+        }
+        dropDanglingDependsOn(resources, remove);
+        List<String> referencedBy = new ArrayList<>();
+        resources.properties().forEach(entry -> {
+            if (referencesAny(entry.getValue(), remove)) {
+                referencedBy.add("Resources." + entry.getKey() + " (" + entry.getValue().path("Type").asText() + ")");
+            }
+        });
+        template.path("Outputs").properties().forEach(entry -> {
+            if (referencesAny(entry.getValue(), remove)) {
+                referencedBy.add("Outputs." + entry.getKey());
+            }
+        });
+        if (!referencedBy.isEmpty()) {
+            throw new IllegalArgumentException("Cannot remove " + remove + " for MiniStack: still referred to by "
+                + referencedBy);
+        }
     }
 
     private static void removeUnsupportedApplicationAutoScaling(

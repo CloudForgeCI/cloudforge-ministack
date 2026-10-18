@@ -196,13 +196,14 @@ class MiniStackDatabasesTest {
     }
 
     @Test
-    void compactingRemovesWhitespaceAndRejectsATemplateThatIsStillTooLargeToSendInline() throws Exception {
+    void compactingRemovesWhitespaceAndATemplateOverTheInlineLimitGoesThroughS3() throws Exception {
         String pretty = "{\n  \"Resources\" : {\n    \"T\" : {\"Type\" : \"AWS::SNS::Topic\"}\n  }\n}";
         assertEquals("{\"Resources\":{\"T\":{\"Type\":\"AWS::SNS::Topic\"}}}", MiniStackDeployer.compact(pretty));
 
         String huge = "{\"Resources\":{\"T\":{\"Type\":\"AWS::SNS::Topic\",\"Properties\":{\"DisplayName\":\""
             + "x".repeat(MiniStackDeployer.MAX_INLINE_TEMPLATE_BYTES) + "\"}}}}";
-        Assertions.assertThrows(IOException.class, () -> MiniStackDeployer.compact(huge));
+        Assertions.assertTrue(MiniStackDeployer.fitsInline(MiniStackDeployer.compact(pretty)));
+        Assertions.assertFalse(MiniStackDeployer.fitsInline(MiniStackDeployer.compact(huge)));
     }
 
     @Test
