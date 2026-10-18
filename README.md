@@ -180,6 +180,14 @@ the fleet, the full 30 deployment fleet over three accounts and three regions ev
 `validation/run-from-source.sh` runs the installed CLI with this checkout's code, so the workflow tests
 the change under review, and `--only-waves 3` reruns a single wave of a plan to reproduce a failure.
 
+`validation/manager_hierarchy.py` deploys a hierarchy of CloudForge Managers and deploys through each level: a hub
+Manager on account `000000000000`, a Manager deployed through it into each of `111111111111` and `222222222222`,
+and an application deployed through each of those into its own account, once as an admin and once as a manager
+user. Accounts are linked the way a customer does it, with the template the Manager returns, and every stack is
+checked to exist in its target account only. It needs a Manager image tagged
+`cloudforgeci/cloudforge-manager:<image-tag>` that includes the MiniStack cross-account support, and a
+`cfc-synth` container on `cfc-network` for the Managers to synthesize with, which the script starts when absent.
+
 Wider coverage lives in cfc-core's `validation/scripts/ministack-app-matrix.py`, which deploys every
 registered application, and with `--db-versions` every database engine and version each one lists.
 
