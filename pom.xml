@@ -11,7 +11,7 @@
     <groupId>com.cloudforgeci</groupId>
     <artifactId>cfc-core</artifactId>
     <!-- Tracks cfc-core's latest published SNAPSHOT — kept current by sync-versions.yml. -->
-    <version>3.2.20-SNAPSHOT</version>
+    <version>3.3.3-SNAPSHOT</version>
     <relativePath/>
   </parent>
 
@@ -20,7 +20,7 @@
        which has its own independent release cadence): this module was a reactor member of
        cfc-core until it moved to its own repository, and stays released alongside it on the same
        version number, just via a <parent> reference instead of reactor membership. -->
-  <version>3.2.20-SNAPSHOT</version>
+  <version>3.3.3-SNAPSHOT</version>
   <packaging>jar</packaging>
   <name>CloudForge MiniStack</name>
   <description>MiniStack local deployment adapter, deployer, and pipeline for CloudForge templates</description>
@@ -64,6 +64,21 @@
     <dependency>
       <groupId>software.amazon.awssdk</groupId>
       <artifactId>cloudformation</artifactId>
+      <version>${aws.sdk.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>ssm</artifactId>
+      <version>${aws.sdk.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>rds</artifactId>
+      <version>${aws.sdk.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>cognitoidentityprovider</artifactId>
       <version>${aws.sdk.version}</version>
     </dependency>
 
@@ -111,6 +126,9 @@
       </plugin>
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
+        <!-- Pinned: with 3.6.0, which the published cfc-core parent leaves to Maven's default, the
+             excludedGroups below no longer kept the tests that need a running MiniStack out of the build. -->
+        <version>3.5.4</version>
         <configuration>
           <excludedGroups>ministack</excludedGroups>
         </configuration>
@@ -140,6 +158,115 @@
             <configuration combine.self="override">
               <!-- Run full module test suite (unit + @Tag("ministack") integration) -->
             </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <!-- Publishes to Maven Central via the Central Portal. Defined here rather than inherited:
+         cfc-core's flatten-maven-plugin strips <profiles> from the POM it publishes, so the
+         parent resolved from Central has no "release" profile. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <pluginManagement>
+          <plugins>
+            <plugin>
+              <groupId>org.apache.maven.plugins</groupId>
+              <artifactId>maven-javadoc-plugin</artifactId>
+              <version>3.7.0</version>
+              <configuration>
+                <doclint>none</doclint>
+                <failOnError>false</failOnError>
+              </configuration>
+              <executions>
+                <execution>
+                  <id>attach-javadocs</id>
+                  <goals><goal>jar</goal></goals>
+                </execution>
+              </executions>
+            </plugin>
+
+            <plugin>
+              <groupId>org.apache.maven.plugins</groupId>
+              <artifactId>maven-gpg-plugin</artifactId>
+              <!-- Matches cfc-core root pom's pin (see its comment for why 3.2.8); keep them in
+                   sync. -->
+              <version>3.2.8</version>
+              <executions>
+                <execution>
+                  <id>sign-artifacts</id>
+                  <phase>verify</phase>
+                  <goals><goal>sign</goal></goals>
+                </execution>
+              </executions>
+            </plugin>
+          </plugins>
+        </pluginManagement>
+        <plugins>
+          <!-- Central Portal publisher (replaces old OSSRH/staging) -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.9.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>validated</waitUntil>
+              <ignorePublishedComponents>true</ignorePublishedComponents>
+              <centralSnapshotsUrl>https://central.sonatype.com/repository/maven-snapshots/</centralSnapshotsUrl>
+            </configuration>
+          </plugin>
+
+          <!-- Attach sources -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <phase>verify</phase>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Attach javadocs -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <executions>
+              <execution><id>attach-javadocs</id><goals><goal>jar</goal></goals></execution>
+            </executions>
+            <configuration><failOnError>false</failOnError></configuration>
+          </plugin>
+
+          <!-- GPG signing (Central requires .asc) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+            <configuration>
+              <gpgArguments>
+                <arg>--pinentry-mode</arg><arg>loopback</arg>
+              </gpgArguments>
+              <homedir>${env.GPG_HOMEDIR}</homedir>
+            </configuration>
+          </plugin>
+
+          <!-- Skip the default deploy plugin, which would otherwise fail with "repository element
+               was not specified in the POM inside distributionManagement"; publishing is done by
+               central-publishing-maven-plugin. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-deploy-plugin</artifactId>
+            <configuration><skip>true</skip></configuration>
           </plugin>
         </plugins>
       </build>

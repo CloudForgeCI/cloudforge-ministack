@@ -1,6 +1,7 @@
 package com.cloudforgeci.ministack;
 
 import com.cloudforge.core.config.DeploymentConfig;
+import com.cloudforge.core.enums.TopologyType;
 import com.cloudforge.core.local.DeploymentTarget;
 import com.cloudforge.core.local.LocalHostPortConflictChecker;
 import com.cloudforge.core.local.LocalHostPortOccupant;
@@ -31,22 +32,21 @@ class MiniStackDeployPreflightTest {
     Path tempDir;
 
     @Test
-    void blocksWhenProvisionDatabaseEnabled() throws Exception {
+    void allowsProvisioningADatabaseBecauseTheDeployerCreatesIt() throws Exception {
         DeploymentConfig config = new DeploymentConfig();
         config.provisionDatabase = true;
 
         PreflightResult result = MiniStackDeployPreflight.validate(config, null, null);
 
-        assertFalse(result.allowed(PreflightMode.ENFORCE));
-        assertEquals("RDS_REQUIRED", result.blockingViolations().getFirst().ruleId());
+        assertTrue(result.allowed(PreflightMode.ENFORCE));
     }
 
     @Test
     void blocksUnsupportedCfnTypesInTemplate() throws Exception {
         ObjectNode template = MAPPER.createObjectNode();
         template.putObject("Resources")
-            .putObject("DbParams")
-            .put("Type", "AWS::RDS::DBParameterGroup");
+            .putObject("Cluster")
+            .put("Type", "AWS::RDS::DBCluster");
         Path canonical = tempDir.resolve("mattermost.json");
         Files.writeString(canonical, MAPPER.writeValueAsString(template));
 
@@ -130,28 +130,30 @@ class MiniStackDeployPreflightTest {
 
     @Test
     void enforceModeThrowsFormattedMessage() throws Exception {
-        DeploymentConfig config = new DeploymentConfig();
-        config.provisionDatabase = true;
-        PreflightResult result = MiniStackDeployPreflight.validate(config, null, null);
+        ObjectNode template = MAPPER.createObjectNode();
+        template.putObject("Resources").putObject("Cluster").put("Type", "AWS::RDS::DBCluster");
+        Path canonical = tempDir.resolve("aurora.json");
+        Files.writeString(canonical, MAPPER.writeValueAsString(template));
+        PreflightResult result = MiniStackDeployPreflight.validate(new DeploymentConfig(), null, canonical);
 
         java.io.IOException blocked = assertThrows(
             java.io.IOException.class,
             () -> result.throwIfBlocked(PreflightMode.ENFORCE));
-        assertTrue(blocked.getMessage().contains("RDS"));
+        assertTrue(blocked.getMessage().contains("AWS::RDS::DBCluster"));
         assertTrue(blocked.getMessage().contains("cloudforge-cli"));
     }
 
     @Test
-    void blocksTemplateReferencingTheLocalEmulatorZoneMarker() throws Exception {
+    void blocksAReferenceToTheLocalEmulatorZoneOutsideItsRecordSets() throws Exception {
         // CloudForgeSynthesizer#seedHostedZoneContext seeds this placeholder for any local-emulator
         // deploy (LocalStack or MiniStack, indistinguishable by account alone) with an existing
-        // domain and createZone: false. Safe for LocalStack, which strips Route53 RecordSets before
-        // deploy; MiniStack does not, so a template still referencing it must be blocked here.
+        // domain and createZone: false. The adapter removes the Route 53 records that use it; any
+        // other resource that still refers to the zone cannot be deployed.
         ObjectNode template = MAPPER.createObjectNode();
-        template.putObject("Resources")
-            .putObject("DnsRecord")
-            .putObject("Properties")
-            .put("HostedZoneId", "/hostedzone/LOCALEMULATORZONE");
+        ObjectNode resources = template.putObject("Resources");
+        ObjectNode other = resources.putObject("Validation");
+        other.put("Type", "AWS::CertificateManager::Certificate");
+        other.putObject("Properties").put("HostedZoneId", "/hostedzone/LOCALEMULATORZONE");
         Path canonical = tempDir.resolve("with-domain.json");
         Files.writeString(canonical, MAPPER.writeValueAsString(template));
 
@@ -159,5 +161,46 @@ class MiniStackDeployPreflightTest {
 
         assertFalse(result.allowed(PreflightMode.ENFORCE));
         assertEquals("UNRESOLVABLE_HOSTED_ZONE", result.blockingViolations().getFirst().ruleId());
+    }
+
+    @Test
+    void allowsRecordSetsAtTheLocalEmulatorZoneBecauseTheAdapterRemovesThem() throws Exception {
+        ObjectNode template = MAPPER.createObjectNode();
+        ObjectNode record = template.putObject("Resources").putObject("DnsRecord");
+        record.put("Type", "AWS::Route53::RecordSet");
+        record.putObject("Properties").put("HostedZoneId", "/hostedzone/LOCALEMULATORZONE");
+        Path canonical = tempDir.resolve("subdomain.json");
+        Files.writeString(canonical, MAPPER.writeValueAsString(template));
+
+        PreflightResult result = MiniStackDeployPreflight.validate(new DeploymentConfig(), null, canonical);
+
+        assertTrue(result.allowed(PreflightMode.ENFORCE));
+    }
+
+    @Test
+    void allowsTheCmsTopologyEveryCmsApplicationUses() throws Exception {
+        DeploymentConfig config = new DeploymentConfig();
+        config.topology = TopologyType.CMS_SERVICE;
+
+        assertTrue(MiniStackDeployPreflight.validate(config, null, null).allowed(PreflightMode.ENFORCE));
+    }
+
+    @Test
+    void stillBlocksATopologyMiniStackCannotRun() throws Exception {
+        DeploymentConfig config = new DeploymentConfig();
+        config.topology = TopologyType.S3_WEBSITE;
+
+        PreflightResult result = MiniStackDeployPreflight.validate(config, null, null);
+
+        assertFalse(result.allowed(PreflightMode.ENFORCE));
+        assertEquals("TOPOLOGY_UNSUPPORTED", result.blockingViolations().getFirst().ruleId());
+    }
+
+    @Test
+    void hostPortsAreOnlyCheckedWhereMiniStackPublishesTaskPorts() {
+        assertTrue(MiniStackDeployPreflight.checksHostPorts("ministackorg/ministack:1.4.9", null));
+        assertFalse(MiniStackDeployPreflight.checksHostPorts("ministackorg/ministack:1.5.27", null));
+        assertFalse(MiniStackDeployPreflight.checksHostPorts("ministackorg/ministack:1.4.9", "true"));
+        assertTrue(MiniStackDeployPreflight.checksHostPorts("ministackorg/ministack:1.5.27", "false"));
     }
 }

@@ -1,24 +1,32 @@
 package com.cloudforgeci.ministack;
 
+import com.cloudforge.core.local.LocalEmulatorDefaults;
+import com.cloudforge.core.local.LocalEmulatorSpec;
 import com.cloudforge.core.local.TemplateAdaptation;
 import com.cloudforge.core.local.TemplateAdaptationResult;
 import com.cloudforge.core.local.TemplateAdapter;
 import com.cloudforge.core.local.TemplateAdapterSupport;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Produces the explicitly-audited template deployed to MiniStack.
@@ -32,6 +40,20 @@ import java.util.Set;
  */
 public final class MiniStackTemplateAdapter implements TemplateAdapter {
     public static final MiniStackTemplateAdapter INSTANCE = new MiniStackTemplateAdapter();
+
+    /**
+     * Creates a host directory for a volume and lets any user write to it. Application images run as an
+     * unprivileged user (Jenkins, Grafana), and on a Linux host a bind mount keeps the owner of the
+     * directory, so one created by the deploying user would be read-only to the container.
+     */
+    static void createVolumeDirectory(Path directory) throws IOException {
+        Files.createDirectories(directory);
+        try {
+            Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("rwxrwxrwx"));
+        } catch (UnsupportedOperationException e) {
+            // A file system without POSIX permissions has no owner to work around.
+        }
+    }
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String DEFAULT_VOLUME_ROOT = ".ministack-volumes";
@@ -71,6 +93,11 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         ObjectNode local = canonicalTemplate.deepCopy();
         List<TemplateAdaptation> adaptations = new ArrayList<>();
         removeUnsupportedApplicationAutoScaling(local, adaptations);
+        removeLogRetentionCustomResources(local, adaptations);
+        replacePrivateCertificateAuthorityWithPlainHttp(local, adaptations);
+        moveUnsupportedCognitoResourcesToMetadata(local, adaptations);
+        markManagerAsLocalEmulatorTarget(local, adaptations);
+        routeSubdomainThroughTheEdge(local, adaptations);
         replaceUnsupportedEfsWithHostBindMounts(local, adaptations, stackName);
         inlineUnsupportedSecurityGroupIngress(local, adaptations);
         redirectUnsupportedEcsTargets(local, adaptations);
@@ -134,11 +161,415 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         remove.forEach(resources::remove);
     }
 
-    private static void redirectUnsupportedEcsTargets(
+    /**
+     * CDK sets log-group retention for some constructs, such as the RDS log exports, through a
+     * {@code Custom::LogRetention} resource that a CDK-provided Lambda function has to answer.
+     * MiniStack does not run that function, so the resource stays in {@code CREATE_IN_PROGRESS}
+     * and the stack never finishes. Retention is a CloudWatch Logs setting with no bearing on the
+     * running application, so the custom resources are removed together with the provider function,
+     * role and policy once nothing else refers to them.
+     */
+    private static void removeLogRetentionCustomResources(
             ObjectNode template,
             List<TemplateAdaptation> adaptations) {
         ObjectNode resources = asObject(template.get("Resources"));
         if (resources == null) {
+            return;
+        }
+
+        List<String> remove = new ArrayList<>();
+        resources.properties().forEach(entry -> {
+            if ("Custom::LogRetention".equals(entry.getValue().path("Type").asText())) {
+                remove.add(entry.getKey());
+            }
+        });
+        if (remove.isEmpty()) {
+            return;
+        }
+
+        // The singleton provider CDK creates for these resources, named LogRetention<hash>, with its
+        // service role and default policy. Only taken along when no other resource refers to them.
+        List<String> provider = new ArrayList<>();
+        resources.properties().forEach(entry -> {
+            String type = entry.getValue().path("Type").asText();
+            if (entry.getKey().startsWith("LogRetention") && !remove.contains(entry.getKey())
+                    && ("AWS::Lambda::Function".equals(type) || "AWS::IAM::Role".equals(type)
+                        || "AWS::IAM::Policy".equals(type))) {
+                provider.add(entry.getKey());
+            }
+        });
+        List<String> takenAlong = new ArrayList<>();
+        for (String key : provider) {
+            boolean referencedElsewhere = resources.properties().stream()
+                .filter(entry -> !remove.contains(entry.getKey()) && !provider.contains(entry.getKey()))
+                .anyMatch(entry -> entry.getValue().toString().contains("\"" + key + "\""))
+                || template.path("Outputs").toString().contains("\"" + key + "\"");
+            if (!referencedElsewhere) {
+                takenAlong.add(key);
+            }
+        }
+
+        for (String key : remove) {
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + key,
+                "MiniStack does not run the Lambda behind Custom::LogRetention; log retention is not applied locally",
+                resources.get(key).deepCopy()));
+        }
+        for (String key : takenAlong) {
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + key,
+                "Log retention provider is unused once its custom resources are removed",
+                resources.get(key).deepCopy()));
+        }
+        remove.forEach(resources::remove);
+        takenAlong.forEach(resources::remove);
+    }
+
+    /**
+     * Without a domain, CloudForge issues the load balancer's certificate from an AWS Private CA
+     * (a CA, a root certificate, its activation and an ACM permission, then an ACM certificate that
+     * names the CA). MiniStack's CloudFormation has no {@code AWS::ACMPCA} types, and its load
+     * balancer cannot terminate HTTPS anyway. The chain and the certificates issued from it are
+     * removed, the HTTPS listener goes with them, and the HTTP listener, which redirected to HTTPS,
+     * forwards to the application's target group instead.
+     */
+    private static void replacePrivateCertificateAuthorityWithPlainHttp(
+            ObjectNode template,
+            List<TemplateAdaptation> adaptations) {
+        ObjectNode resources = asObject(template.get("Resources"));
+        if (resources == null) {
+            return;
+        }
+
+        List<String> privateCa = new ArrayList<>();
+        resources.properties().forEach(entry -> {
+            JsonNode resource = entry.getValue();
+            String type = resource.path("Type").asText();
+            boolean issuedFromPrivateCa = "AWS::CertificateManager::Certificate".equals(type)
+                && resource.path("Properties").has("CertificateAuthorityArn");
+            if (type.startsWith("AWS::ACMPCA::") || issuedFromPrivateCa) {
+                privateCa.add(entry.getKey());
+            }
+        });
+        if (privateCa.isEmpty()) {
+            return;
+        }
+
+        // Listeners whose certificates all come from the removed chain are HTTPS-only.
+        List<String> httpsListeners = new ArrayList<>();
+        String forwardTarget = null;
+        for (var entry : (Iterable<Map.Entry<String, JsonNode>>) resources.properties()) {
+            JsonNode resource = entry.getValue();
+            if (!"AWS::ElasticLoadBalancingV2::Listener".equals(resource.path("Type").asText())) {
+                continue;
+            }
+            JsonNode properties = resource.path("Properties");
+            if ("HTTPS".equals(properties.path("Protocol").asText())
+                    && referencesAny(properties.path("Certificates"), privateCa)) {
+                httpsListeners.add(entry.getKey());
+                for (JsonNode action : properties.path("DefaultActions")) {
+                    if ("forward".equals(action.path("Type").asText()) && forwardTarget == null
+                            && action.has("TargetGroupArn")) {
+                        forwardTarget = action.path("TargetGroupArn").toString();
+                    }
+                }
+            }
+        }
+
+        if (forwardTarget != null) {
+            for (var entry : (Iterable<Map.Entry<String, JsonNode>>) resources.properties()) {
+                JsonNode resource = entry.getValue();
+                if (!"AWS::ElasticLoadBalancingV2::Listener".equals(resource.path("Type").asText())
+                        || httpsListeners.contains(entry.getKey())) {
+                    continue;
+                }
+                ObjectNode properties = asObject(resource.get("Properties"));
+                if (properties == null || !properties.path("DefaultActions").isArray()) {
+                    continue;
+                }
+                ArrayNode actions = (ArrayNode) properties.get("DefaultActions");
+                for (int i = 0; i < actions.size(); i++) {
+                    JsonNode action = actions.get(i);
+                    if ("redirect".equals(action.path("Type").asText())
+                            && "HTTPS".equals(action.path("RedirectConfig").path("Protocol").asText())) {
+                        try {
+                            ObjectNode forward = (ObjectNode) new ObjectMapper()
+                                .readTree("{\"Type\":\"forward\",\"TargetGroupArn\":" + forwardTarget + "}");
+                            actions.set(i, forward);
+                            adaptations.add(new TemplateAdaptation(
+                                "Resources." + entry.getKey() + ".Properties.DefaultActions",
+                                "MiniStack cannot terminate HTTPS; forward HTTP to the application instead of redirecting",
+                                action.deepCopy()));
+                        } catch (JsonProcessingException e) {
+                            throw new IllegalStateException(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        List<String> remove = new ArrayList<>(privateCa);
+        remove.addAll(httpsListeners);
+        for (String key : remove) {
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + key,
+                "MiniStack has no AWS Private CA and cannot terminate HTTPS; the private certificate chain is not created locally",
+                resources.get(key).deepCopy()));
+        }
+        remove.forEach(resources::remove);
+        dropDanglingDependsOn(resources, remove);
+    }
+
+    private static boolean referencesAny(JsonNode node, List<String> logicalIds) {
+        String text = node.toString();
+        return logicalIds.stream().anyMatch(id -> text.contains("\"" + id + "\""));
+    }
+
+    private static void dropDanglingDependsOn(ObjectNode resources, List<String> removed) {
+        resources.properties().forEach(entry -> {
+            if (!(entry.getValue() instanceof ObjectNode resource) || !resource.has("DependsOn")) {
+                return;
+            }
+            JsonNode dependsOn = resource.get("DependsOn");
+            if (dependsOn.isArray()) {
+                ArrayNode kept = resource.arrayNode();
+                dependsOn.forEach(item -> {
+                    if (!removed.contains(item.asText())) {
+                        kept.add(item);
+                    }
+                });
+                if (kept.isEmpty()) {
+                    resource.remove("DependsOn");
+                } else {
+                    resource.set("DependsOn", kept);
+                }
+            } else if (removed.contains(dependsOn.asText())) {
+                resource.remove("DependsOn");
+            }
+        });
+    }
+
+    /**
+     * MiniStack's CloudFormation creates user pools, groups, clients and domains, but has no
+     * {@code AWS::Cognito::UserPoolUser}, {@code UserPoolUserToGroupAttachment} or
+     * {@code ManagedLoginBranding}. Branding only styles the hosted sign-in page and is dropped. The
+     * users and their group memberships are removed from the resources and recorded under
+     * {@link MiniStackCognitoUsers#METADATA_KEY}, so the deployer can create them through the
+     * Cognito API once the pool exists.
+     */
+    private static void moveUnsupportedCognitoResourcesToMetadata(
+            ObjectNode template,
+            List<TemplateAdaptation> adaptations) {
+        ObjectNode resources = asObject(template.get("Resources"));
+        if (resources == null) {
+            return;
+        }
+        ObjectNode recorded = MiniStackCognitoUsers.record(resources);
+        List<String> remove = new ArrayList<>();
+        resources.properties().forEach(entry -> {
+            String type = entry.getValue().path("Type").asText();
+            if ("AWS::Cognito::ManagedLoginBranding".equals(type)
+                    || "AWS::Cognito::UserPoolUser".equals(type)
+                    || "AWS::Cognito::UserPoolUserToGroupAttachment".equals(type)) {
+                remove.add(entry.getKey());
+            }
+        });
+        if (remove.isEmpty()) {
+            return;
+        }
+        for (String key : remove) {
+            String type = resources.get(key).path("Type").asText();
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + key,
+                "ManagedLoginBranding".equals(type.substring(type.lastIndexOf(':') + 1))
+                    ? "MiniStack has no managed login branding; the hosted sign-in page is not styled locally"
+                    : "MiniStack CloudFormation cannot create Cognito users or group memberships; they are created through the Cognito API after the stack",
+                resources.get(key).deepCopy()));
+        }
+        remove.forEach(resources::remove);
+        dropDanglingDependsOn(resources, remove);
+        if (recorded.path("users").size() > 0 || recorded.path("memberships").size() > 0) {
+            ObjectNode metadata = template.has("Metadata") && template.get("Metadata").isObject()
+                ? (ObjectNode) template.get("Metadata")
+                : template.putObject("Metadata");
+            metadata.set(MiniStackCognitoUsers.METADATA_KEY, recorded);
+        }
+    }
+
+    /** Set to {@code true} or {@code false} to override the choice made from the pinned MiniStack image. */
+    static final String ALB_FORWARD_ENV = "CFC_MINISTACK_ALB_FORWARD";
+
+    /**
+     * MiniStack 1.5 and later forward a load balancer listener to ECS targets, and do not publish task
+     * ports on the host, so the listener has to keep its forward action. 1.4.x could not forward, and
+     * published the task port, which the redirect below points at. The pinned image decides, and
+     * {@value #ALB_FORWARD_ENV} overrides it for an emulator started by hand.
+     */
+    static boolean albForwardsToEcs(String pinnedImage, String override) {
+        if (override != null && !override.isBlank()) {
+            return Boolean.parseBoolean(override.trim());
+        }
+        return isVersion15OrLater(pinnedImage);
+    }
+
+    /** Whether an image tag such as {@code ministackorg/ministack:1.5.27} names MiniStack 1.5 or later. */
+    static boolean isVersion15OrLater(String image) {
+        Matcher version =
+            Pattern.compile(":(\\d+)\\.(\\d+)").matcher(image == null ? "" : image);
+        return version.find()
+            && (Integer.parseInt(version.group(1)) > 1
+                || (Integer.parseInt(version.group(1)) == 1 && Integer.parseInt(version.group(2)) >= 5));
+    }
+
+    /** Placeholder hosted zone id CloudForgeSynthesizer seeds for the shared local emulator account. */
+    static final String LOCAL_EMULATOR_ZONE_MARKER = "LOCALEMULATORZONE";
+
+    /** Environment variable the emulator edge reads to give a task its own hostname. */
+    static final String EDGE_HOSTNAME_ENV = "CFC_LOCALSTACK_EDGE_HOSTNAME";
+
+    /**
+     * A deployment with a {@code subdomain} creates a Route 53 record such as {@code
+     * jenkins2.example.com.}. The records that point at the placeholder hosted zone cannot be created
+     * on MiniStack and are removed. The record's first label gives the task its own edge hostname,
+     * {@code jenkins2.cloudforge.localhost}, passed to every container of the stack's tasks in {@code
+     * CFC_LOCALSTACK_EDGE_HOSTNAME}, so two stacks of one application are served on separate hosts
+     * instead of sharing the application's default one.
+     */
+    private static void routeSubdomainThroughTheEdge(
+            ObjectNode template,
+            List<TemplateAdaptation> adaptations) {
+        ObjectNode resources = asObject(template.get("Resources"));
+        if (resources == null) {
+            return;
+        }
+        List<String> remove = new ArrayList<>();
+        String recordName = null;
+        for (Map.Entry<String, JsonNode> entry : resources.properties()) {
+            if (!"AWS::Route53::RecordSet".equals(entry.getValue().path("Type").asText())) {
+                continue;
+            }
+            JsonNode name = entry.getValue().path("Properties").path("Name");
+            if (recordName == null && name.isTextual() && !name.asText().isBlank()) {
+                recordName = name.asText();
+            }
+            if (entry.getValue().toString().contains(LOCAL_EMULATOR_ZONE_MARKER)) {
+                remove.add(entry.getKey());
+            }
+        }
+        String edgeHostname = edgeHostname(recordName);
+        for (String key : remove) {
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + key,
+                "The record points at a hosted zone that does not exist on MiniStack; the emulator edge routes the hostname",
+                resources.get(key).deepCopy()));
+            resources.remove(key);
+        }
+        if (!remove.isEmpty()) {
+            dropDanglingDependsOn(resources, remove);
+        }
+        if (edgeHostname == null) {
+            return;
+        }
+        resources.properties().forEach(entry -> {
+            if (!"AWS::ECS::TaskDefinition".equals(entry.getValue().path("Type").asText())) {
+                return;
+            }
+            JsonNode containers = entry.getValue().path("Properties").path("ContainerDefinitions");
+            for (JsonNode container : containers) {
+                if (!(container instanceof ObjectNode containerNode)) {
+                    continue;
+                }
+                ArrayNode environment = container.path("Environment").isArray()
+                    ? (ArrayNode) container.path("Environment")
+                    : containerNode.putArray("Environment");
+                upsertEnvironment(environment, EDGE_HOSTNAME_ENV, edgeHostname);
+            }
+            adaptations.add(new TemplateAdaptation(
+                "Resources." + entry.getKey() + ".Properties.ContainerDefinitions[*].Environment",
+                "Gives the task its own edge hostname, " + edgeHostname,
+                null));
+        });
+    }
+
+    /**
+     * {@code jenkins2.example.com.} becomes {@code jenkins2.cloudforge.localhost}: only the first label
+     * is kept, since the registered domain means nothing under the emulator's own suffix. Null when
+     * there is no usable record name.
+     */
+    static String edgeHostname(String route53RecordName) {
+        if (route53RecordName == null) {
+            return null;
+        }
+        String trimmed = route53RecordName.trim();
+        while (trimmed.endsWith(".")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        }
+        int dot = trimmed.indexOf('.');
+        String label = (dot < 0 ? trimmed : trimmed.substring(0, dot)).toLowerCase(Locale.ROOT).trim();
+        return label.isBlank() ? null : label + ".cloudforge.localhost";
+    }
+
+    /**
+     * CloudForge Manager decides where first-time setup is accepted from by its target. Reached
+     * through the emulator's load balancer, a request is not from loopback, so a Manager that does not
+     * know it runs in a local emulator refuses setup from a browser. Tells it, and where the emulator is.
+     */
+    private static void markManagerAsLocalEmulatorTarget(
+            ObjectNode template,
+            List<TemplateAdaptation> adaptations) {
+        ObjectNode resources = asObject(template.get("Resources"));
+        if (resources == null) {
+            return;
+        }
+        resources.properties().forEach(entry -> {
+            if (!"AWS::ECS::TaskDefinition".equals(entry.getValue().path("Type").asText())) {
+                return;
+            }
+            JsonNode containers = entry.getValue().path("Properties").path("ContainerDefinitions");
+            for (JsonNode container : containers) {
+                if (!(container instanceof ObjectNode containerNode) || !isManagerContainer(containerNode)) {
+                    continue;
+                }
+                ArrayNode environment = containerNode.path("Environment").isArray()
+                    ? (ArrayNode) containerNode.get("Environment")
+                    : containerNode.putArray("Environment");
+                upsertEnvironment(environment, "CFC_MANAGER_TARGET", "ministack");
+                upsertEnvironment(environment, "CFC_MANAGER_MINISTACK_ENDPOINT",
+                    "http://" + LocalEmulatorDefaults.MINISTACK_CONTAINER + ":4566");
+                adaptations.add(new TemplateAdaptation(
+                    "Resources." + entry.getKey() + ".Properties.ContainerDefinitions[].Environment",
+                    "Manager runs in a local emulator: setup is accepted through the load balancer, and the emulator endpoint is set",
+                    NullNode.instance));
+            }
+        });
+    }
+
+    private static boolean isManagerContainer(ObjectNode container) {
+        for (JsonNode env : container.path("Environment")) {
+            String name = env.path("Name").asText();
+            if ("CFC_MANAGER_PORT".equals(name) || "CFC_MANAGER_AUTH_MODE".equals(name)) {
+                return true;
+            }
+        }
+        return container.path("Image").asText("").toLowerCase(Locale.ROOT).contains("cloudforge-manager");
+    }
+
+    private static void upsertEnvironment(ArrayNode environment, String name, String value) {
+        for (JsonNode entry : environment) {
+            if (name.equals(entry.path("Name").asText()) && entry instanceof ObjectNode existing) {
+                existing.put("Value", value);
+                return;
+            }
+        }
+        environment.addObject().put("Name", name).put("Value", value);
+    }
+
+    private static void redirectUnsupportedEcsTargets(
+            ObjectNode template,
+            List<TemplateAdaptation> adaptations) {
+        ObjectNode resources = asObject(template.get("Resources"));
+        if (resources == null || albForwardsToEcs(
+                LocalEmulatorSpec.ministack().image(), System.getenv(ALB_FORWARD_ENV))) {
             return;
         }
 
@@ -284,11 +715,15 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         }
 
         Set<String> removedLogicalIds = new LinkedHashSet<>();
+        Set<String> retainedFileSystems = new LinkedHashSet<>();
         Iterator<Map.Entry<String, JsonNode>> fields = resources.properties().iterator();
         while (fields.hasNext()) {
             Map.Entry<String, JsonNode> entry = fields.next();
             if (entry.getValue().path("Type").asText().startsWith("AWS::EFS::")) {
                 removedLogicalIds.add(entry.getKey());
+                if (entry.getValue().path("DeletionPolicy").asText("").startsWith("Retain")) {
+                    retainedFileSystems.add(entry.getKey());
+                }
                 adaptations.add(new TemplateAdaptation(
                     "Resources." + entry.getKey(),
                     "MiniStack CloudFormation does not support AWS::EFS resources",
@@ -342,7 +777,7 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
                 String reason;
                 boolean hostMountUsable;
                 try {
-                    Files.createDirectories(hostPath);
+                    createVolumeDirectory(hostPath);
                     hostMountUsable = true;
                 } catch (IOException e) {
                     // Mirrors LocalStackTemplateAdapter's equivalent block (see its comment).
@@ -372,7 +807,11 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
                 volumes.set(index, replacement);
 
                 if (hostMountUsable) {
-                    String outputKey = hostVolumeOutputKey(volumeName);
+                    // A file system the template retains outlives the stack, so its directory is not
+                    // listed under the key the deployer removes on destroy.
+                    boolean retained = retainedFileSystems.contains(
+                        volume.path("EFSVolumeConfiguration").path("FilesystemId").path("Ref").asText(""));
+                    String outputKey = hostVolumeOutputKey(volumeName, retained);
                     if (!outputs.has(outputKey)) {
                         outputs.putObject(outputKey)
                             .put("Description",
@@ -413,8 +852,8 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         return root.toAbsolutePath().normalize();
     }
 
-    private static String hostVolumeOutputKey(String volumeName) {
-        return "MiniStackHostVolume"
+    private static String hostVolumeOutputKey(String volumeName, boolean retained) {
+        return (retained ? "MiniStackRetainedHostVolume" : MiniStackDeployer.HOST_VOLUME_OUTPUT_PREFIX)
             + volumeName.substring(0, 1).toUpperCase()
             + volumeName.substring(1);
     }
@@ -520,7 +959,9 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         }
 
         int applicationPort = findEcsApplicationPort(resources);
-        if (applicationPort > 0 && !outputs.has("MiniStackApplicationUrl")) {
+        boolean taskPortPublished = !albForwardsToEcs(
+            LocalEmulatorSpec.ministack().image(), System.getenv(ALB_FORWARD_ENV));
+        if (applicationPort > 0 && taskPortPublished && !outputs.has("MiniStackApplicationUrl")) {
             outputs.putObject("MiniStackApplicationUrl")
                 .put("Description", "Direct local ECS application URL")
                 .put("Value", "http://localhost:" + applicationPort);

@@ -1,0 +1,78 @@
+{
+  "comment": "Applications the fleet test deploys. memoryMb is the task memory plus a database container for applications that provision one, used to pack waves into a memory budget. expect is http (the application answers on its hostname, any status below 500) or tcp (only the ECS service is checked). images are pulled before the run so MiniStack, which pulls anonymously, finds them in the local cache when Docker Hub rate limits it.",
+  "apps": [
+    {
+      "id": "jenkins",
+      "memoryMb": 1200,
+      "expect": "http",
+      "path": "/login",
+      "images": [
+        "jenkins/jenkins:lts"
+      ]
+    },
+    {
+      "id": "gitea",
+      "memoryMb": 400,
+      "expect": "http",
+      "path": "/",
+      "images": [
+        "gitea/gitea:latest"
+      ]
+    },
+    {
+      "id": "grafana",
+      "memoryMb": 400,
+      "expect": "http",
+      "path": "/login",
+      "images": [
+        "grafana/grafana:latest"
+      ]
+    },
+    {
+      "id": "vault",
+      "memoryMb": 300,
+      "expect": "http",
+      "path": "/ui/",
+      "images": [
+        "hashicorp/vault:latest"
+      ]
+    },
+    {
+      "id": "prometheus",
+      "memoryMb": 300,
+      "expect": "http",
+      "path": "/",
+      "images": [
+        "prom/prometheus:latest"
+      ]
+    },
+    {
+      "id": "redis",
+      "memoryMb": 150,
+      "expect": "tcp",
+      "images": [
+        "redis:7-alpine"
+      ]
+    },
+    {
+      "id": "wordpress",
+      "memoryMb": 900,
+      "expect": "http",
+      "path": "/",
+      "database": true,
+      "images": [
+        "wordpress:php8.2-apache"
+      ]
+    },
+    {
+      "id": "joomla",
+      "memoryMb": 900,
+      "expect": "http",
+      "path": "/",
+      "database": true,
+      "images": [
+        "joomla:5-php8.2-apache"
+      ]
+    }
+  ]
+}

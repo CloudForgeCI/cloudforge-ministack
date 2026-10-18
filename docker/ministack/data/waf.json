@@ -1,0 +1,1 @@
+{"__ministack_format__": 3, "payload": {"_web_acls": {"__account_region_scoped__": true, "data": {}}, "_ip_sets": {"__account_region_scoped__": true, "data": {}}, "_rule_groups": {"__account_region_scoped__": true, "data": {}}, "_associations": {"__account_region_scoped__": true, "data": {}}, "_waf_tags": {"__scoped__": true, "data": {}}}}
