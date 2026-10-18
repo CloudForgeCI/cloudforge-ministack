@@ -846,6 +846,9 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
                 String reason;
                 boolean hostMountUsable;
                 try {
+                    if (runsInContainer() && System.getenv("MINISTACK_VOLUME_ROOT") == null) {
+                        throw new IOException("running inside a container, whose file system is not the Docker host's");
+                    }
                     createVolumeDirectory(hostPath);
                     hostMountUsable = true;
                 } catch (IOException e) {
@@ -907,6 +910,14 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         String safeStackName = stackName == null || stackName.isBlank() ? "local" : stackName;
         String safeVolumeName = volumeName == null || volumeName.isBlank() ? "data" : volumeName;
         return root.resolve(safeStackName).resolve(safeVolumeName).toAbsolutePath().normalize();
+    }
+
+    /**
+     * Whether this process runs inside a container. Directories it creates then exist in the container, not on
+     * the Docker host that resolves a bind mount, unless {@code MINISTACK_VOLUME_ROOT} names a path both share.
+     */
+    static boolean runsInContainer() {
+        return Files.exists(Paths.get("/.dockerenv"));
     }
 
     static Path defaultVolumeRoot() {

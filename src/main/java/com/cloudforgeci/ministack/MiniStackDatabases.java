@@ -93,6 +93,14 @@ final class MiniStackDatabases {
      * exists inside a local emulator.
      */
     static String localPassword(String identifier) {
+        return localPassword(identifier, 0);
+    }
+
+    /**
+     * The local password stretched to {@code length} characters when that is longer than the default, for a
+     * generated secret that asks for a {@code PasswordLength} (an AES key must decode to a fixed number of bytes).
+     */
+    static String localPassword(String identifier, int length) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256")
                 .digest(("cfc-ministack-db:" + identifier).getBytes(StandardCharsets.UTF_8));
@@ -100,7 +108,14 @@ final class MiniStackDatabases {
             for (int i = 0; i < 12; i++) {
                 password.append(Integer.toHexString((digest[i] & 0xff) | 0x100).substring(1));
             }
-            return password.toString();
+            MessageDigest sha = MessageDigest.getInstance("SHA-256");
+            while (password.length() < length) {
+                digest = sha.digest(digest);
+                for (int i = 0; i < digest.length && password.length() < length; i++) {
+                    password.append(Integer.toHexString((digest[i] & 0xff) | 0x100).substring(1));
+                }
+            }
+            return length > 0 && length < password.length() ? password.substring(0, length) : password.toString();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
         }
@@ -189,7 +204,7 @@ final class MiniStackDatabases {
             if (!"AWS::SecretsManager::Secret".equals(resource.path("Type").asText()) || !generate.isObject()) {
                 return;
             }
-            String password = localPassword("secret:" + entry.getKey());
+            String password = localPassword("secret:" + entry.getKey(), generate.path("PasswordLength").asInt(0));
             String key = generate.path("GenerateStringKey").asText("");
             JsonNode value;
             if (key.isEmpty()) {

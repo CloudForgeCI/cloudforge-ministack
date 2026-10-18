@@ -247,4 +247,18 @@ class MiniStackDatabasesTest {
         assertFalse(MiniStackDatabaseProvisioner.reusable(false, "ministack-rds-1-instance-db"));
         assertFalse(MiniStackDatabaseProvisioner.reusable(false, null));
     }
+
+    @Test
+    void aGeneratedSecretHasTheLengthItAsksFor() throws Exception {
+        ObjectNode template = (ObjectNode) new ObjectMapper().readTree("""
+            {"Resources":{"Key":{"Type":"AWS::SecretsManager::Secret","Properties":{
+              "GenerateSecretString":{"PasswordLength":32,"ExcludePunctuation":true}}}}}""");
+
+        String value = MiniStackDatabases.inlineGeneratedSecrets(template)
+            .path("Resources").path("Key").path("Properties").path("SecretString").asText();
+
+        assertEquals(32, value.length());
+        assertTrue(value.matches("[A-Za-z0-9]+"));
+        assertEquals(value, MiniStackDatabases.localPassword("secret:Key", 32));
+    }
 }

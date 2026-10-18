@@ -8,6 +8,7 @@ import com.cloudforge.core.local.LocalResourceChange;
 import com.cloudforge.core.local.LocalSameApplicationStackReplacer;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.nio.charset.StandardCharsets;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
@@ -36,6 +37,7 @@ import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.BucketAlreadyExistsException;
 import software.amazon.awssdk.services.s3.model.BucketAlreadyOwnedByYouException;
 import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.ssm.model.ParameterNotFoundException;
 
 import java.io.IOException;
@@ -173,6 +175,53 @@ public final class MiniStackDeployer implements LocalDeployer {
         }
     }
 
+    /** The account the credentials of this deployer belong to. */
+    private String accountId() {
+        try (StsClient sts = StsClient.builder()
+                .endpointOverride(URI.create(endpoint))
+                .region(Region.of(region))
+                .credentialsProvider(credentials)
+                .build()) {
+            return sts.getCallerIdentity().account();
+        }
+    }
+
+    /**
+     * Gives the containers of a stack in an account other than the default that account's access key. MiniStack
+     * serves a task's role credentials without knowing which account the task belongs to and always answers as
+     * the default account, so an application that asks AWS who it is, such as a Manager, would otherwise be
+     * told the wrong account. A container that sets the variables itself keeps its own values.
+     */
+    static String pinTasksToAccount(String templateBody, String accountId) throws IOException {
+        if (accountId == null || MiniStackCredentials.DEFAULT_ACCOUNT.equals(accountId)) {
+            return templateBody;
+        }
+        var template = (ObjectNode) MAPPER.readTree(templateBody);
+        template.path("Resources").properties().forEach(resource -> {
+            if (!"AWS::ECS::TaskDefinition".equals(resource.getValue().path("Type").asText())) {
+                return;
+            }
+            for (JsonNode definition : resource.getValue().path("Properties").path("ContainerDefinitions")) {
+                var container = (ObjectNode) definition;
+                var environment = container.has("Environment") && container.get("Environment").isArray()
+                    ? (ArrayNode) container.get("Environment")
+                    : container.putArray("Environment");
+                putIfAbsent(environment, "AWS_ACCESS_KEY_ID", accountId);
+                putIfAbsent(environment, "AWS_SECRET_ACCESS_KEY", "test");
+            }
+        });
+        return MAPPER.writeValueAsString(template);
+    }
+
+    private static void putIfAbsent(ArrayNode environment, String name, String value) {
+        for (JsonNode entry : environment) {
+            if (name.equals(entry.path("Name").asText())) {
+                return;
+            }
+        }
+        environment.addObject().put("Name", name).put("Value", value);
+    }
+
     private void requireCdkBootstrap(String templateBody) throws IOException {
         var parameter = MiniStackCdkBootstrap.requiredParameter(templateBody);
         if (parameter.isEmpty()) {
@@ -194,7 +243,7 @@ public final class MiniStackDeployer implements LocalDeployer {
             emptyHostVolumes(hostVolumesIn(templateBody), MiniStackTemplateAdapter.defaultVolumeRoot());
         }
         List<String> createdDatabases = new ArrayList<>();
-        templateBody = compact(provisionDatabases(templateBody, createdDatabases));
+        templateBody = compact(pinTasksToAccount(provisionDatabases(templateBody, createdDatabases), accountId()));
         try {
             return deployStack(stackName, templateBody, exists);
         } catch (IOException | RuntimeException e) {
