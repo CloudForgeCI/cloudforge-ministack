@@ -1,0 +1,1 @@
+{"stackName":"SpokeManager2","applicationId":"cloudforge-manager","applicationName":"CloudForge Manager","environment":"development","runtime":"FARGATE","authMode":"none","topology":null,"securityProfile":"DEV","complianceMode":null,"complianceFrameworks":[],"region":"us-east-1","domain":"example.com","fqdn":null}
