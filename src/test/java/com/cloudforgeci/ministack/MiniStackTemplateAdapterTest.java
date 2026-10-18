@@ -192,6 +192,50 @@ class MiniStackTemplateAdapterTest {
     }
 
     @Test
+    void removesTheComplianceResourcesMiniStackCannotCreateAndKeepsTheOnesItCan() throws Exception {
+        ObjectNode template = (ObjectNode) MAPPER.readTree("""
+            {"Resources":{
+              "Trail":{"Type":"AWS::CloudTrail::Trail","Properties":{}},
+              "Detector":{"Type":"AWS::GuardDuty::Detector","Properties":{}},
+              "Vault":{"Type":"AWS::Backup::BackupVault","Properties":{}},
+              "Plan":{"Type":"AWS::Backup::BackupPlan","Properties":{}},
+              "Selection":{"Type":"AWS::Backup::BackupSelection","DependsOn":["Plan"],"Properties":{"BackupPlanId":{"Ref":"Plan"}}},
+              "Bucket":{"Type":"AWS::S3::Bucket","DependsOn":["Trail","Vault"],"Properties":{}}}}""");
+
+        TemplateAdaptationResult result = MiniStackTemplateAdapter.adapt(template);
+
+        var resources = result.template().path("Resources");
+        assertFalse(resources.has("Trail"));
+        assertFalse(resources.has("Detector"));
+        assertFalse(resources.has("Selection"));
+        assertTrue(resources.has("Vault"));
+        assertTrue(resources.has("Plan"));
+        assertEquals("Vault", resources.path("Bucket").path("DependsOn").get(0).asText());
+        assertEquals(1, resources.path("Bucket").path("DependsOn").size());
+    }
+
+    @Test
+    void removesACustomResourceThatOnlyRecordsARemovedResource() throws Exception {
+        ObjectNode template = (ObjectNode) MAPPER.readTree("""
+            {"Resources":{"Trail":{"Type":"AWS::CloudTrail::Trail","Properties":{}},
+              "TrailArnWriter":{"Type":"AWS::CloudFormation::CustomResource","Properties":{"Create":{"Fn::GetAtt":["Trail","Arn"]}}}}}""");
+
+        var resources = MiniStackTemplateAdapter.adapt(template).template().path("Resources");
+
+        assertFalse(resources.has("Trail"));
+        assertFalse(resources.has("TrailArnWriter"));
+    }
+
+    @Test
+    void refusesToRemoveAComplianceResourceThatSomethingStillReferences() throws Exception {
+        ObjectNode template = (ObjectNode) MAPPER.readTree("""
+            {"Resources":{"Trail":{"Type":"AWS::CloudTrail::Trail","Properties":{}},
+              "Bucket":{"Type":"AWS::S3::Bucket","Properties":{"Tags":[{"Key":"t","Value":{"Fn::GetAtt":["Trail","Arn"]}}]}}}}""");
+
+        assertThrows(IllegalArgumentException.class, () -> MiniStackTemplateAdapter.adapt(template));
+    }
+
+    @Test
     void removesLogRetentionCustomResourcesAndTheirUnusedProvider() throws Exception {
         ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
             {
