@@ -162,5 +162,114 @@
         </plugins>
       </build>
     </profile>
+    <!-- Publishes to Maven Central via the Central Portal. Defined here rather than inherited:
+         cfc-core's flatten-maven-plugin strips <profiles> from the POM it publishes, so the
+         parent resolved from Central has no "release" profile. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <pluginManagement>
+          <plugins>
+            <plugin>
+              <groupId>org.apache.maven.plugins</groupId>
+              <artifactId>maven-javadoc-plugin</artifactId>
+              <version>3.7.0</version>
+              <configuration>
+                <doclint>none</doclint>
+                <failOnError>false</failOnError>
+              </configuration>
+              <executions>
+                <execution>
+                  <id>attach-javadocs</id>
+                  <goals><goal>jar</goal></goals>
+                </execution>
+              </executions>
+            </plugin>
+
+            <plugin>
+              <groupId>org.apache.maven.plugins</groupId>
+              <artifactId>maven-gpg-plugin</artifactId>
+              <!-- Matches cfc-core root pom's pin (see its comment for why 3.2.8); keep them in
+                   sync. -->
+              <version>3.2.8</version>
+              <executions>
+                <execution>
+                  <id>sign-artifacts</id>
+                  <phase>verify</phase>
+                  <goals><goal>sign</goal></goals>
+                </execution>
+              </executions>
+            </plugin>
+          </plugins>
+        </pluginManagement>
+        <plugins>
+          <!-- Central Portal publisher (replaces old OSSRH/staging) -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.9.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>validated</waitUntil>
+              <ignorePublishedComponents>true</ignorePublishedComponents>
+              <centralSnapshotsUrl>https://central.sonatype.com/repository/maven-snapshots/</centralSnapshotsUrl>
+            </configuration>
+          </plugin>
+
+          <!-- Attach sources -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <phase>verify</phase>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Attach javadocs -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <executions>
+              <execution><id>attach-javadocs</id><goals><goal>jar</goal></goals></execution>
+            </executions>
+            <configuration><failOnError>false</failOnError></configuration>
+          </plugin>
+
+          <!-- GPG signing (Central requires .asc) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+            <configuration>
+              <gpgArguments>
+                <arg>--pinentry-mode</arg><arg>loopback</arg>
+              </gpgArguments>
+              <homedir>${env.GPG_HOMEDIR}</homedir>
+            </configuration>
+          </plugin>
+
+          <!-- Skip the default deploy plugin, which would otherwise fail with "repository element
+               was not specified in the POM inside distributionManagement"; publishing is done by
+               central-publishing-maven-plugin. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-deploy-plugin</artifactId>
+            <configuration><skip>true</skip></configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
   </profiles>
 </project>
