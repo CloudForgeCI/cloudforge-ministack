@@ -45,28 +45,52 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      - name: Update the <parent> version to cfc-core's latest real release
-        run: >
-          mvn -B -q versions:update-parent
-          -DallowSnapshots=false
-          -DgenerateBackupPoms=false
+      # Resolved directly from Central's metadata, not versions:update-parent: that plugin only
+      # updates to something it considers "newer" than the current value, and by plain version
+      # ordering a SNAPSHOT of a higher number (e.g. 3.3.8-SNAPSHOT) sorts newer than a lower real
+      # release (3.3.2) -- so once the parent is a SNAPSHOT, that plugin can never move it back
+      # down to a real release. Confirmed: this workflow ran clean with no error and changed
+      # nothing. A direct string comparison has no such blind spot.
+      - name: Resolve cfc-core's latest real release
+        id: latest
+        run: |
+          RELEASE=$(curl -fsSL "https://repo1.maven.org/maven2/com/cloudforgeci/cfc-core/maven-metadata.xml" \
+            | grep -o '<release>[^<]*</release>' | sed -E 's|</?release>||g')
+          if [ -z "$RELEASE" ]; then
+            echo "::error::Could not resolve cfc-core's latest release from Central's maven-metadata.xml"
+            exit 1
+          fi
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
 
       - name: Check for changes
         id: diff
         run: |
-          if git diff --quiet -- pom.xml; then
+          PARENT=$(mvn -q help:evaluate -Dexpression=project.parent.version -DforceStdout)
+          RELEASE="${{ steps.latest.outputs.release }}"
+          if [ "$PARENT" = "$RELEASE" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No upstream version change detected; nothing to do."
+            echo "Parent is already cfc-core $RELEASE; nothing to do."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Parent is $PARENT; cfc-core's latest release is $RELEASE."
+            python3 -c "
+            import re
+            p = 'pom.xml'
+            s = open(p).read()
+            new = re.sub(
+                r'(<parent>.*?<artifactId>cfc-core</artifactId>\s*\n\s*(?:<!--.*?-->\s*\n\s*)?<version>)[^<]+(</version>)',
+                r'\g<1>$RELEASE\g<2>', s, count=1, flags=re.S)
+            assert new != s, 'parent version pattern did not match'
+            open(p, 'w').write(new)
+            "
             git diff -- pom.xml
           fi
 
-      - name: Set this module's own version to match the parent
+      # This repo's own develop always carries a -SNAPSHOT, same as every other repo's develop --
+      # only the parent moves to a real release, never this module's own version.
+      - name: Set this module's own version to match the parent, as a SNAPSHOT
         if: steps.diff.outputs.changed == 'true'
-        run: |
-          NEW_VERSION=$(mvn -q help:evaluate -Dexpression=project.parent.version -DforceStdout)
-          mvn -B -q versions:set -DnewVersion="$NEW_VERSION" -DgenerateBackupPoms=false
+        run: mvn -B -q versions:set -DnewVersion="${{ steps.latest.outputs.release }}-SNAPSHOT" -DgenerateBackupPoms=false
 
       - name: Validate against the updated version
         if: steps.diff.outputs.changed == 'true'
