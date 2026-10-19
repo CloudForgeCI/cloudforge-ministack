@@ -1,11 +1,17 @@
 name: Sync cfc-core version
 
-# Keeps this repo in lockstep with cfc-core's own version (both the <parent> reference and this
-# module's own <version>, per the lockstep design in this repo's pom.xml comments): whenever
-# cfc-core publishes a new SNAPSHOT or release, this bumps both to match.
+# Keeps this repo's <parent> reference (and, to match, this module's own <version>) on cfc-core's
+# latest REAL RELEASE -- never a SNAPSHOT. Tracking cfc-core's in-progress SNAPSHOT instead was
+# tried and broken: this repo's own build then depends on cfc-core's current develop tip actually
+# existing on Central at the exact moment this runs, which is a race against cfc-core's own
+# release/bump cadence in a different repo, not something either side controls. Pinning to the
+# latest real release means this repo always builds against something that stays resolvable.
 #
-# Pull-based (this repo polls cfc-core's published Central snapshots metadata) -- mirrors
-# cfc-core's own sync-cloudforge-manager-deployment-version.yml.
+# publish-release-branch.yml (in cfc-core) is what forces this repo's <version>/<parent> to match
+# an in-progress cfc-core release exactly, but only locally, in that one build -- never by
+# committing here. That's the only place a SNAPSHOT-level match actually matters.
+#
+# Pull-based (this repo polls cfc-core's published Central release metadata).
 
 on:
   schedule:
@@ -23,7 +29,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync to cfc-core's latest published version
+    name: Sync to cfc-core's latest real release
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -39,12 +45,11 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      - name: Update the <parent> version to cfc-core's latest SNAPSHOT
+      - name: Update the <parent> version to cfc-core's latest real release
         run: >
           mvn -B -q versions:update-parent
-          -DallowSnapshots=true
+          -DallowSnapshots=false
           -DgenerateBackupPoms=false
-          "-Dmaven.version.ignore=^[0-9]+\.[0-9]+\.[0-9]+$"
 
       - name: Check for changes
         id: diff
