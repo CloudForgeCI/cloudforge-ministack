@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: write
+  actions: write # to dispatch publish-snapshot.yml below
 
 concurrency:
   group: sync-cfc-core-version
@@ -105,3 +106,14 @@ jobs:
           git commit -m "chore(deps): sync to cfc-core version=${NEW_VERSION} [skip ci]"
           git pull --rebase origin develop
           git push origin HEAD:develop
+
+      # [skip ci] on the commit above means no workflow fires for it at all, on top of
+      # GITHUB_TOKEN pushes never triggering other workflows' `push` trigger regardless --
+      # confirmed live: this version bump landed on develop but nothing ever actually published
+      # it, so cfc-core's own builds kept failing to resolve a SNAPSHOT that was pinned but never
+      # real. Dispatching explicitly is what actually publishes it.
+      - name: Trigger publish-snapshot.yml for the bumped version
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run publish-snapshot.yml --ref develop
