@@ -1,16 +1,17 @@
 name: Publish to Maven Central
 
-# Builds, tests, and publishes this module. Version is never bumped here; sync-cfc-core-version.yml
-# keeps it in lockstep with cfc-core's own version.
+# Builds, tests, and publishes this module's -SNAPSHOT at every point that matters. develop is the
+# only branch -- there is no main, and no separate release cut of this repo's own: the version here
+# is never bumped by hand, only kept in lockstep with cfc-core's own SNAPSHOT by
+# sync-cfc-core-version.yml. A real release of this module is cut from cfc-core's own release
+# pipeline instead (publish-release-branch.yml, in cfc-core's own repo), which builds this repo from
+# this same develop tip with the version forced to that release's number and publishes it directly --
+# not from anything committed here.
 #
 #   pull request   against develop, publishes the -SNAPSHOT version, so cfc-core and the other repos
 #                  can build against the change under review (as cfc-core's own pull requests do).
 #                  Pull requests from forks do not publish: they have no access to the secrets.
-#   push to develop  publishes the -SNAPSHOT version again after a merge. develop is the default
-#                  branch, as in cfc-core, and only ever publishes snapshots.
-#   push to main   publishes the release version. When the pom still carries a -SNAPSHOT version
-#                  nothing is published, because a release needs a released cfc-core parent, which
-#                  sync-cfc-core-version.yml adopts once cfc-core publishes one.
+#   push to develop  publishes the -SNAPSHOT version again after a merge.
 #
 # Required repo secrets (same four cfc-core's own publish workflows use):
 #   GPG_PRIVATE_KEY, GPG_PASSPHRASE, CENTRAL_PORTAL_USERNAME, CENTRAL_PORTAL_PASSWORD
@@ -20,7 +21,7 @@ on:
     branches: [ develop ]
     types: [ opened, synchronize, reopened ]
   push:
-    branches: [ develop, main ]
+    branches: [ develop ]
   workflow_dispatch: {}
 
 jobs:
@@ -62,28 +63,21 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      - name: Match the version to the trigger
+      - name: Decide whether to publish
         id: decide
         run: |
           VERSION=$(mvn -q -pl . help:evaluate -Dexpression=project.version -DforceStdout)
+          if [[ "$VERSION" != *-SNAPSHOT ]]; then
+            echo "::error::Version '$VERSION' is not a SNAPSHOT -- develop should always carry one. Something overwrote it."
+            exit 1
+          fi
           publish=false
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
               echo "Pull request from a fork: no secrets, nothing published."
-            elif [[ "$VERSION" == *-SNAPSHOT ]]; then
-              publish=true
             else
-              echo "::error::Version '$VERSION' is not a SNAPSHOT; pull requests publish snapshots only."
-              exit 1
-            fi
-          elif [ "${{ github.ref_name }}" = "develop" ]; then
-            if [[ "$VERSION" == *-SNAPSHOT ]]; then
               publish=true
-            else
-              echo "Version '$VERSION' is a release: releases are published from main."
             fi
-          elif [[ "$VERSION" == *-SNAPSHOT ]]; then
-            echo "Version '$VERSION' is a SNAPSHOT: nothing to release from this push."
           else
             publish=true
           fi
