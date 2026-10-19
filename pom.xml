@@ -223,7 +223,6 @@
               <publishingServerId>central</publishingServerId>
               <autoPublish>true</autoPublish>
               <waitUntil>validated</waitUntil>
-              <ignorePublishedComponents>true</ignorePublishedComponents>
               <centralSnapshotsUrl>https://central.sonatype.com/repository/maven-snapshots/</centralSnapshotsUrl>
             </configuration>
           </plugin>
