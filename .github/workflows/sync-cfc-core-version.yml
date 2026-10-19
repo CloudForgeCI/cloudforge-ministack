@@ -73,17 +73,16 @@ jobs:
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "Parent is $PARENT; cfc-core's latest release is $RELEASE."
-            python3 -c "
-            import re
-            p = 'pom.xml'
-            s = open(p).read()
-            new = re.sub(
-                r'(<parent>.*?<artifactId>cfc-core</artifactId>\s*\n\s*(?:<!--.*?-->\s*\n\s*)?<version>)[^<]+(</version>)',
-                r'\g<1>$RELEASE\g<2>', s, count=1, flags=re.S)
-            assert new != s, 'parent version pattern did not match'
-            open(p, 'w').write(new)
-            "
-            git diff -- pom.xml
+            # Range-restricted to between <artifactId>cfc-core</artifactId> and the closing
+            # </parent>, so this only ever touches the parent's own <version>, never this
+            # module's own <version> tag elsewhere in the file.
+            sed -i "/<artifactId>cfc-core<\/artifactId>/,/<\/parent>/ s|<version>[^<]*</version>|<version>${RELEASE}</version>|" pom.xml
+            if ! git diff --quiet -- pom.xml; then
+              git diff -- pom.xml
+            else
+              echo "::error::sed did not change pom.xml -- the <parent> pattern did not match."
+              exit 1
+            fi
           fi
 
       # This repo's own develop always carries a -SNAPSHOT, same as every other repo's develop --
