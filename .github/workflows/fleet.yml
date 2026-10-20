@@ -38,7 +38,7 @@ on:
         default: '000000000000,111111111111,222222222222'
       core_ref:
         description: 'cfc-core branch or tag to deploy with'
-        default: 'feat/ministack-1-5-support'
+        default: 'develop'
       apps:
         description: 'Comma-separated application ids from validation/fleet-apps.json (default: all)'
         default: ''
@@ -78,12 +78,11 @@ jobs:
 
       # The fleet deploys with the cfc-core build of a named ref, not the -SNAPSHOT on Central: every cfc-core
       # pull request publishes to that one coordinate, so the latest snapshot is whichever branch published last.
-      # Once the MiniStack 1.5 work is on develop, change the default ref to develop.
       - name: Check out cfc-core
         uses: actions/checkout@v4
         with:
           repository: CloudForgeCI/cfc-core
-          ref: ${{ inputs.core_ref || 'feat/ministack-1-5-support' }}
+          ref: ${{ inputs.core_ref || 'develop' }}
           path: cfc-core
 
       - name: Build cloudforge-api from the cfc-core checkout
