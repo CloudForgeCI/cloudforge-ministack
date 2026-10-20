@@ -217,6 +217,34 @@
           </plugins>
         </pluginManagement>
         <plugins>
+          <!-- Flattens the parent-inherited license/developers and this module's own
+               unversioned dependencies (e.g. cloudforge-core, left to the parent's
+               dependencyManagement) into the published pom. Central's validator rejects a pom it
+               would have to resolve a parent to make sense of, same as it rejects one missing
+               those fields outright. Same shape as cfc-core's own copy of this plugin. -->
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>flatten-maven-plugin</artifactId>
+            <version>1.7.3</version>
+            <configuration>
+              <updatePomFile>true</updatePomFile>
+              <flattenMode>bom</flattenMode>
+              <flattenedPomFilename>${project.build.directory}/${project.artifactId}-${project.version}.pom</flattenedPomFilename>
+            </configuration>
+            <executions>
+              <execution>
+                <id>flatten</id>
+                <phase>process-resources</phase>
+                <goals><goal>flatten</goal></goals>
+              </execution>
+              <execution>
+                <id>flatten.clean</id>
+                <phase>clean</phase>
+                <goals><goal>clean</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
           <!-- Central Portal publisher (replaces old OSSRH/staging) -->
           <plugin>
             <groupId>org.sonatype.central</groupId>
