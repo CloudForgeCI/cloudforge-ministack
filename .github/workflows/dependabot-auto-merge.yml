@@ -1,0 +1,34 @@
+name: Dependabot Auto-Merge
+
+# Enables GitHub's auto-merge on a dependabot PR for a patch or minor bump -- auto-merge still
+# waits for every one of develop's required status checks to pass before actually merging, this
+# just removes the need for a human to click merge. A major version bump always needs a human:
+# semver only promises patch/minor are backward compatible, and that's true for a security fix
+# too -- a major-bump security fix still gets a PR, just not an automatic merge.
+
+on:
+  pull_request_target:
+    branches: [ develop ]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Enable auto-merge
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Enable auto-merge for patch/minor updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"

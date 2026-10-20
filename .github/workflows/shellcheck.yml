@@ -1,0 +1,31 @@
+name: ShellCheck
+
+# Lints every tracked shell script for bug patterns (unquoted expansions, unset variable use,
+# command-injection-shaped constructs) -- CodeQL doesn't cover Shell, so this is the only static
+# analysis these scripts get.
+
+on:
+  push:
+    branches: [ develop ]
+  pull_request:
+    branches: [ develop ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          # error only: these scripts have never been linted before and carry a pre-existing
+          # tail of style warnings (SC2155, SC2034, SC2046...) that aren't worth blocking a PR
+          # over. Syntax and logic errors still fail the check.
+          severity: error
