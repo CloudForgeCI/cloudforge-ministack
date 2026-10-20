@@ -48,7 +48,11 @@
       <id>central-snapshots</id>
       <url>https://central.sonatype.com/repository/maven-snapshots/</url>
       <releases><enabled>false</enabled></releases>
-      <snapshots><enabled>true</enabled></snapshots>
+      <!-- updatePolicy=always: without it, Maven caches a "not found" or stale result for a
+           whole day (the default), and that negative cache persists across CI runs along with
+           the rest of ~/.m2. A build that runs before cfc-core's own matching SNAPSHOT finishes
+           publishing can then fail every build for the rest of the day even once it exists. -->
+      <snapshots><enabled>true</enabled><updatePolicy>always</updatePolicy></snapshots>
     </repository>
   </repositories>
 
