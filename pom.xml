@@ -37,7 +37,7 @@
 
   <properties>
     <aws.sdk.version>2.56.0</aws.sdk.version>
-    <testcontainers.version>1.21.0</testcontainers.version>
+    <testcontainers.version>2.0.5</testcontainers.version>
   </properties>
 
   <!-- Maven doesn't check the Central Portal's snapshots URL by default — needed to resolve the
