@@ -3,6 +3,12 @@ name: ShellCheck
 # Lints every tracked shell script for bug patterns (unquoted expansions, unset variable use,
 # command-injection-shaped constructs) -- CodeQL doesn't cover Shell, so this is the only static
 # analysis these scripts get.
+#
+# Downloads the static shellcheck binary directly rather than using a Docker container action:
+# a container action is Linux-only by GitHub Actions' own platform rules, which would make this
+# job unable to run on the self-hosted mac-mini runner at all. The static binary ships for both
+# linux.x86_64 (GitHub-hosted) and darwin.aarch64 (the mac-mini, native Apple Silicon), so the
+# same job works on whichever runner a PR lands on.
 
 on:
   push:
@@ -17,15 +23,29 @@ permissions:
 jobs:
   shellcheck:
     name: ShellCheck
-    runs-on: ubuntu-latest
+    # See codeql-analysis.yml's analyze job for why dependabot PRs route to the self-hosted
+    # runner.
+    runs-on: ${{ github.actor == 'dependabot[bot]' && fromJSON('["self-hosted", "mac-mini"]') || 'ubuntu-latest' }}
+    env:
+      SHELLCHECK_VERSION: v0.11.0
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install ShellCheck
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) PLATFORM=linux.x86_64 ;;
+            Darwin-arm64) PLATFORM=darwin.aarch64 ;;
+            *) echo "::error::Unsupported platform $(uname -s)-$(uname -m) for shellcheck $SHELLCHECK_VERSION"; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.${PLATFORM}.tar.xz" \
+            | tar -xJ -C /tmp
+          echo "/tmp/shellcheck-${SHELLCHECK_VERSION}" >> "$GITHUB_PATH"
+
       - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@2.0.0
-        with:
+        run: |
           # error only: these scripts have never been linted before and carry a pre-existing
           # tail of style warnings (SC2155, SC2034, SC2046...) that aren't worth blocking a PR
           # over. Syntax and logic errors still fail the check.
-          severity: error
+          git ls-files '*.sh' | xargs shellcheck --severity=error

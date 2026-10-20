@@ -12,7 +12,9 @@ on:
 jobs:
   analyze:
     name: Analyze Code
-    runs-on: ubuntu-latest
+    # See publish-snapshot.yml's build-test job for why dependabot PRs route to the self-hosted
+    # runner.
+    runs-on: ${{ github.actor == 'dependabot[bot]' && fromJSON('["self-hosted", "mac-mini"]') || 'ubuntu-latest' }}
     timeout-minutes: 360
 
     permissions:

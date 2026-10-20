@@ -27,7 +27,13 @@ on:
 jobs:
   build-test:
     name: Build & test
-    runs-on: ubuntu-latest
+    # A dependabot PR routes to the org's self-hosted mac-mini runner instead of the shared
+    # GitHub-hosted pool -- a dependabot PR only ever contains a dependency-manifest bump it
+    # generated itself, lower-risk than an arbitrary human or fork PR, and that volume was the
+    # single biggest source of queued jobs. Needs Maven + JDK 25 on the runner; both are
+    # installed there. The publish job below stays on ubuntu-latest regardless of actor -- it's a
+    # trusted-deploy step (Central Portal credentials), not something to move for queue relief.
+    runs-on: ${{ github.actor == 'dependabot[bot]' && fromJSON('["self-hosted", "mac-mini"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - name: Checkout code
