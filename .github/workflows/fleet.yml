@@ -67,7 +67,7 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4
@@ -79,7 +79,7 @@ jobs:
       # The fleet deploys with the cfc-core build of a named ref, not the -SNAPSHOT on Central: every cfc-core
       # pull request publishes to that one coordinate, so the latest snapshot is whichever branch published last.
       - name: Check out cfc-core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: CloudForgeCI/cfc-core
           ref: ${{ inputs.core_ref || 'develop' }}
