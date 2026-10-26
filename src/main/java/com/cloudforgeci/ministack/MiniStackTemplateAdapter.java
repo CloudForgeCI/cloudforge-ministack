@@ -99,6 +99,8 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         replacePrivateCertificateAuthorityWithPlainHttp(local, adaptations);
         moveUnsupportedCognitoResourcesToMetadata(local, adaptations);
         markManagerAsLocalEmulatorTarget(local, adaptations);
+        substituteMySql57(local, adaptations, hostIsArm64() && !keepMySql57());
+        MiniStackSidecarAliases.adapt(local, adaptations, stackName);
         routeSubdomainThroughTheEdge(local, adaptations);
         replaceUnsupportedEfsWithHostBindMounts(local, adaptations, stackName);
         inlineUnsupportedSecurityGroupIngress(local, adaptations);
@@ -145,6 +147,66 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
      * profile deploys without those controls instead of being refused. Nothing in the template may still refer to a
      * removed resource: the deploy fails with the names if something does, rather than leaving a dangling reference.
      */
+    /** Set to {@code true} to keep MySQL 5.7 on an arm64 host, for example with the amd64 image pulled by hand. */
+    static final String KEEP_MYSQL57_ENV = "CFC_MINISTACK_KEEP_MYSQL57";
+
+    private static boolean hostIsArm64() {
+        String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+        return "aarch64".equals(arch) || "arm64".equals(arch);
+    }
+
+    private static boolean keepMySql57() {
+        return Boolean.parseBoolean(System.getenv(KEEP_MYSQL57_ENV));
+    }
+
+    /**
+     * The official {@code mysql:5.7} image is built for amd64 only, so an arm64 host cannot pull it and the
+     * database never starts. There the instance runs MySQL 8.0 instead, and a parameter group of the 5.7
+     * family follows it. Only the local run changes; the template for AWS keeps 5.7.
+     */
+    static void substituteMySql57(ObjectNode template, List<TemplateAdaptation> adaptations, boolean substitute) {
+        ObjectNode resources = asObject(template.get("Resources"));
+        if (!substitute || resources == null) {
+            return;
+        }
+        resources.properties().forEach(entry -> {
+            ObjectNode properties = asObject(entry.getValue().path("Properties"));
+            if (properties == null) {
+                return;
+            }
+            String type = entry.getValue().path("Type").asText();
+            if ("AWS::RDS::DBInstance".equals(type) && "mysql".equals(properties.path("Engine").asText())
+                    && properties.path("EngineVersion").asText("").startsWith("5.7")) {
+                adaptations.add(new TemplateAdaptation(
+                    "Resources." + entry.getKey() + ".Properties.EngineVersion",
+                    "mysql:5.7 has no arm64 image, so this host runs MySQL 8.0 instead",
+                    properties.get("EngineVersion").deepCopy()));
+                properties.put("EngineVersion", "8.0");
+            } else if ("AWS::RDS::DBParameterGroup".equals(type)
+                    && "mysql5.7".equals(properties.path("Family").asText())) {
+                adaptations.add(new TemplateAdaptation(
+                    "Resources." + entry.getKey() + ".Properties.Family",
+                    "The database runs MySQL 8.0 here, so its parameter group uses that family",
+                    properties.get("Family").deepCopy()));
+                properties.put("Family", "mysql8.0");
+            }
+        });
+    }
+
+    /**
+     * A custom resource that only reads: a STAGING or PRODUCTION deployment uses these to check that a
+     * service such as Security Hub or Inspector is enabled. MiniStack does not run the Lambda behind an
+     * {@code AwsCustomResource}, so the call never completes and the stack waits on it for good. It changes
+     * nothing, so removing it loses only the check.
+     */
+    static boolean isReadOnlyVerification(JsonNode resource) {
+        return "Custom::AWS".equals(resource.path("Type").asText())
+            && READ_ONLY_ACTION.matcher(resource.path("Properties").path("Create").toString()).find();
+    }
+
+    private static final java.util.regex.Pattern READ_ONLY_ACTION =
+        java.util.regex.Pattern.compile("\\\\\"action\\\\\":\\\\\"(get|batchGet|describe|list)", java.util.regex.Pattern.CASE_INSENSITIVE);
+
     private static void removeComplianceResourcesMiniStackCannotCreate(
             ObjectNode template,
             List<TemplateAdaptation> adaptations) {
@@ -154,7 +216,8 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         }
         List<String> remove = new ArrayList<>();
         resources.properties().forEach(entry -> {
-            if (MiniStackCfnResourceCatalog.REMOVED_COMPLIANCE_TYPES.contains(entry.getValue().path("Type").asText())) {
+            if (MiniStackCfnResourceCatalog.REMOVED_COMPLIANCE_TYPES.contains(entry.getValue().path("Type").asText())
+                    || isReadOnlyVerification(entry.getValue())) {
                 remove.add(entry.getKey());
             }
         });
@@ -605,6 +668,10 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
                 upsertEnvironment(environment, "CFC_MANAGER_TARGET", "ministack");
                 upsertEnvironment(environment, "CFC_MANAGER_MINISTACK_ENDPOINT",
                     "http://" + LocalEmulatorDefaults.MINISTACK_CONTAINER + ":4566");
+                upsertEnvironment(environment, "CFC_MANAGER_MINISTACK_AGENT_URL", AGENT_URL_FOR_CONTAINERS);
+                MiniStackAgent.existingToken(System.getenv("CFC_AGENT_TOKEN"), MiniStackAgent.defaultHome(System.getenv()))
+                    .ifPresent(agentToken -> upsertEnvironment(
+                        environment, "CFC_MANAGER_MINISTACK_AGENT_TOKEN", agentToken));
                 adaptations.add(new TemplateAdaptation(
                     "Resources." + entry.getKey() + ".Properties.ContainerDefinitions[].Environment",
                     "Manager runs in a local emulator: setup is accepted through the load balancer, and the emulator endpoint is set",
@@ -613,7 +680,10 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         });
     }
 
-    private static boolean isManagerContainer(ObjectNode container) {
+    /** Where a Manager container reaches the agent, which runs on the Docker host. */
+    static final String AGENT_URL_FOR_CONTAINERS = "http://host.docker.internal:4570";
+
+    static boolean isManagerContainer(ObjectNode container) {
         for (JsonNode env : container.path("Environment")) {
             String name = env.path("Name").asText();
             if ("CFC_MANAGER_PORT".equals(name) || "CFC_MANAGER_AUTH_MODE".equals(name)) {
@@ -623,7 +693,7 @@ public final class MiniStackTemplateAdapter implements TemplateAdapter {
         return container.path("Image").asText("").toLowerCase(Locale.ROOT).contains("cloudforge-manager");
     }
 
-    private static void upsertEnvironment(ArrayNode environment, String name, String value) {
+    static void upsertEnvironment(ArrayNode environment, String name, String value) {
         for (JsonNode entry : environment) {
             if (name.equals(entry.path("Name").asText()) && entry instanceof ObjectNode existing) {
                 existing.put("Value", value);

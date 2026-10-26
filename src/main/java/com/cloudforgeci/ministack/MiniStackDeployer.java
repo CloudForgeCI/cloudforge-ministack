@@ -260,6 +260,7 @@ public final class MiniStackDeployer implements LocalDeployer {
 
     private LocalDeployResult deployStack(String stackName, String templateBody, boolean exists) throws IOException {
         if (exists && templateMatches(stackName, templateBody)) {
+            attachSidecarAliases(stackName, templateBody);
             return new LocalDeployResult(stackName, false, true, List.of(), outputs(stackName));
         }
         String changeSetName = "cfc-" + UUID.randomUUID().toString().substring(0, 8);
@@ -281,6 +282,7 @@ public final class MiniStackDeployer implements LocalDeployer {
             String reason = changeSet.statusReason() == null ? "" : changeSet.statusReason();
             deleteChangeSet(stackName, changeSetName);
             if (isNoOp(reason)) {
+                attachSidecarAliases(stackName, templateBody);
                 return new LocalDeployResult(stackName, false, true, List.of(), outputs(stackName));
             }
             throw new IOException("MiniStack change set failed: " + reason);
@@ -309,7 +311,31 @@ public final class MiniStackDeployer implements LocalDeployer {
         }
 
         createCognitoUsers(stackName, templateBody);
+        attachSidecarAliases(stackName, templateBody);
         return new LocalDeployResult(stackName, !exists, false, changes, outputs(stackName));
+    }
+
+    /** The revision the stack's task definition is at, such as {@code 3}, or null when it cannot be read. */
+    private String taskDefinitionRevision(String stackName, String logicalId) {
+        try {
+            String physicalId = cloudFormation.describeStackResource(r -> r.stackName(stackName).logicalResourceId(logicalId))
+                .stackResourceDetail().physicalResourceId();
+            int colon = physicalId == null ? -1 : physicalId.lastIndexOf(':');
+            return colon < 0 ? null : physicalId.substring(colon + 1);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Attaches the network aliases the template recorded for its sidecar containers. Also done when
+     * nothing changed, since the emulator may have started the containers again since.
+     */
+    private void attachSidecarAliases(String stackName, String templateBody) throws IOException {
+        JsonNode recorded = MAPPER.readTree(templateBody).path("Metadata").path(MiniStackSidecarAliases.METADATA_KEY);
+        if (!recorded.isMissingNode()) {
+            MiniStackSidecarAliases.attach(recorded, stackName, logicalId -> taskDefinitionRevision(stackName, logicalId));
+        }
     }
 
     /** Creates the Cognito users the template declared, which MiniStack's CloudFormation cannot. */
