@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -452,6 +453,8 @@ class MiniStackTemplateAdapterTest {
         manager.path("Environment").forEach(e -> env.put(e.path("Name").asText(), e.path("Value").asText()));
         assertEquals("ministack", env.get("CFC_MANAGER_TARGET"));
         assertEquals("http://cfc-ministack:4566", env.get("CFC_MANAGER_MINISTACK_ENDPOINT"));
+        assertEquals("http://host.docker.internal:4570", env.get("CFC_MANAGER_MINISTACK_AGENT_URL"),
+            "the Manager is told where the agent is");
         assertEquals("none", env.get("CFC_MANAGER_AUTH_MODE"), "existing settings are kept");
         assertEquals(0, resources.path("Task").path("Properties").path("ContainerDefinitions").get(1)
             .path("Environment").size(), "the sidecar is not the Manager");
@@ -508,5 +511,170 @@ class MiniStackTemplateAdapterTest {
         assertEquals("app.cloudforge.localhost", MiniStackTemplateAdapter.edgeHostname("App.Example.Org"));
         assertEquals(null, MiniStackTemplateAdapter.edgeHostname(" "));
         assertEquals(null, MiniStackTemplateAdapter.edgeHostname(null));
+    }
+
+    private static Map<String, String> environmentOf(JsonNode container) {
+        Map<String, String> env = new HashMap<>();
+        container.path("Environment").forEach(e -> env.put(e.path("Name").asText(), e.path("Value").asText()));
+        return env;
+    }
+
+    @Test
+    void pointsTheManagerAtItsSynthSidecarThroughAStackScopedAlias() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {"Resources": {
+              "Task": {"Type": "AWS::ECS::TaskDefinition", "Properties": {"ContainerDefinitions": [
+                {"Name": "manager", "Image": "cloudforgeci/cloudforge-manager:native-latest",
+                 "Environment": [{"Name": "CFC_MANAGER_AUTH_MODE", "Value": "none"}]},
+                {"Name": "cloudforge-synth-service", "Image": "cloudforgeci/cloudforge-synth-service:latest",
+                 "PortMappings": [{"ContainerPort": 8091}], "Environment": []}]}}}}
+            """);
+
+        TemplateAdaptationResult result = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "Mgr_Test.1");
+
+        JsonNode containers = result.template().path("Resources").path("Task").path("Properties")
+            .path("ContainerDefinitions");
+        assertEquals("http://synth-mgr-test-1:8091", environmentOf(containers.get(0)).get("SYNTH_SERVICE_URL"));
+        assertEquals("none", environmentOf(containers.get(0)).get("CFC_MANAGER_AUTH_MODE"), "existing settings are kept");
+        assertFalse(environmentOf(containers.get(1)).containsKey("SYNTH_SERVICE_URL"), "the sidecar is not rewritten");
+
+        JsonNode recorded = result.template().path("Metadata").path(MiniStackSidecarAliases.METADATA_KEY);
+        assertEquals(1, recorded.size());
+        assertEquals("cloudforge-synth-service", recorded.get(0).path("container").asText());
+        assertEquals("synth-mgr-test-1", recorded.get(0).path("alias").asText());
+        assertEquals("Task", recorded.get(0).path("taskDefinition").asText());
+        assertTrue(result.adaptations().stream().anyMatch(a -> a.reason().contains("synth sidecar")));
+        assertFalse(canonical.has("Metadata"), "the canonical template is not changed");
+    }
+
+    @Test
+    void leavesATaskWithoutTheSynthSidecarAndOtherApplicationsAlone() throws Exception {
+        ObjectNode canonical = (ObjectNode) MAPPER.readTree("""
+            {"Resources": {
+              "ManagerOnly": {"Type": "AWS::ECS::TaskDefinition", "Properties": {"ContainerDefinitions": [
+                {"Name": "manager", "Image": "cloudforgeci/cloudforge-manager:native-latest",
+                 "Environment": [{"Name": "CFC_MANAGER_PORT", "Value": "1958"}]}]}},
+              "Other": {"Type": "AWS::ECS::TaskDefinition", "Properties": {"ContainerDefinitions": [
+                {"Name": "app", "Image": "gitea/gitea:latest", "Environment": []},
+                {"Name": "cloudforge-synth-service", "Image": "x", "Environment": []}]}}}}
+            """);
+
+        TemplateAdaptationResult result = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "mgr");
+
+        JsonNode resources = result.template().path("Resources");
+        assertFalse(environmentOf(resources.path("ManagerOnly").path("Properties").path("ContainerDefinitions").get(0))
+            .containsKey("SYNTH_SERVICE_URL"));
+        assertEquals(0, resources.path("Other").path("Properties").path("ContainerDefinitions").get(0)
+            .path("Environment").size());
+        assertTrue(result.template().path("Metadata").path(MiniStackSidecarAliases.METADATA_KEY).isMissingNode());
+    }
+
+    @Test
+    void sidecarAliasIsAValidDnsLabelUniquePerStack() {
+        assertEquals("synth-mgr-t-nocognito", MiniStackSidecarAliases.aliasFor("mgr-t-nocognito"));
+        assertEquals("synth-local", MiniStackSidecarAliases.aliasFor(null));
+        assertEquals("synth-local", MiniStackSidecarAliases.aliasFor("  "));
+        assertEquals("synth-local", MiniStackSidecarAliases.aliasFor("___"));
+        assertNotEquals(MiniStackSidecarAliases.aliasFor("mgr-a"), MiniStackSidecarAliases.aliasFor("mgr-b"));
+        String longAlias = MiniStackSidecarAliases.aliasFor("m".repeat(100));
+        assertTrue(longAlias.length() <= 63);
+        assertTrue(longAlias.matches("[a-z0-9]([a-z0-9-]*[a-z0-9])?"));
+    }
+
+    @Test
+    void selectsTheSidecarContainerOfThisStackAtTheDeployedRevisionOnly() {
+        String listing = "ministack-ecs-aaa-cloudforge-synth-service\tarn:aws:ecs:us-east-1:000000000000:cluster/other-ministack-Cluster1\t4\n"
+            + "ministack-ecs-old-cloudforge-synth-service\tarn:aws:ecs:us-east-1:000000000000:cluster/mgr-ministack-Cluster2\t2\n"
+            + "ministack-ecs-new-cloudforge-synth-service\tarn:aws:ecs:us-east-1:000000000000:cluster/mgr-ministack-Cluster2\t3\n";
+        assertEquals("ministack-ecs-new-cloudforge-synth-service",
+            MiniStackSidecarAliases.selectContainer(listing, "mgr-ministack", "3"), "an update is still rolling out");
+        assertEquals("ministack-ecs-old-cloudforge-synth-service",
+            MiniStackSidecarAliases.selectContainer(listing, "mgr-ministack", "2"));
+        assertEquals(null, MiniStackSidecarAliases.selectContainer(listing, "mgr-ministack", "9"),
+            "no container runs the deployed revision yet");
+        assertEquals("ministack-ecs-old-cloudforge-synth-service",
+            MiniStackSidecarAliases.selectContainer(listing, "mgr-ministack", null), "an unknown revision accepts any");
+        assertEquals(null, MiniStackSidecarAliases.selectContainer(listing, "absent-ministack", "3"));
+        assertEquals(null, MiniStackSidecarAliases.selectContainer("", "mgr-ministack", "3"));
+        assertEquals(null, MiniStackSidecarAliases.selectContainer(null, "mgr-ministack", "3"));
+        assertEquals(null, MiniStackSidecarAliases.selectContainer("no-tab-line", "mgr-ministack", null));
+        assertEquals(null, MiniStackSidecarAliases.selectContainer(
+            "c\tarn:aws:ecs:r:0:cluster/mgr-ministack-C", "mgr-ministack", "3"), "a container with no revision label");
+    }
+
+    private static ObjectNode customResourceCalling(String action, String service) {
+        ObjectNode resource = MAPPER.createObjectNode().put("Type", "Custom::AWS");
+        resource.putObject("Properties").put("Create",
+            "{\"action\":\"" + action + "\",\"service\":\"" + service + "\"}");
+        return resource;
+    }
+
+    @Test
+    void removesTheReadOnlyVerificationsThatNeverCompleteOnMiniStack() {
+        ObjectNode canonical = MAPPER.createObjectNode();
+        ObjectNode resources = canonical.putObject("Resources");
+        resources.set("Verify", customResourceCalling("batchGetAccountStatus", "Inspector2"));
+        resources.set("VerifyHub", customResourceCalling("describeHub", "SecurityHub"));
+        resources.set("Other", customResourceCalling("putParameter", "SSM"));
+        resources.putObject("VerifyPolicy").put("Type", "AWS::IAM::Policy");
+
+        TemplateAdaptationResult result = MiniStackTemplateAdapter.INSTANCE.adapt(canonical, "stg");
+
+        JsonNode adapted = result.template().path("Resources");
+        assertFalse(adapted.has("Verify"), "the Inspector check is removed");
+        assertFalse(adapted.has("VerifyHub"), "any read-only check is removed, not only Inspector's");
+        assertTrue(adapted.has("VerifyPolicy"));
+        assertTrue(adapted.has("Other"), "a custom resource that writes is kept");
+        assertTrue(result.adaptations().stream().anyMatch(a -> a.path().equals("Resources.Verify")));
+    }
+
+    private static ObjectNode mysqlTemplate(String version, String family) throws Exception {
+        return (ObjectNode) MAPPER.readTree("""
+            {"Resources": {
+              "Db": {"Type": "AWS::RDS::DBInstance", "Properties": {"Engine": "mysql", "EngineVersion": "%s"}},
+              "Pg": {"Type": "AWS::RDS::DBParameterGroup", "Properties": {"Family": "%s"}},
+              "Maria": {"Type": "AWS::RDS::DBInstance", "Properties": {"Engine": "mariadb", "EngineVersion": "5.7"}},
+              "Postgres": {"Type": "AWS::RDS::DBInstance", "Properties": {"Engine": "postgres", "EngineVersion": "14"}}}}
+            """.formatted(version, family));
+    }
+
+    @Test
+    void runsMySql80WhereTheHostCannotPullMySql57() throws Exception {
+        ObjectNode template = mysqlTemplate("5.7", "mysql5.7");
+        java.util.List<com.cloudforge.core.local.TemplateAdaptation> adaptations = new java.util.ArrayList<>();
+
+        MiniStackTemplateAdapter.substituteMySql57(template, adaptations, true);
+
+        JsonNode resources = template.path("Resources");
+        assertEquals("8.0", resources.path("Db").path("Properties").path("EngineVersion").asText());
+        assertEquals("mysql8.0", resources.path("Pg").path("Properties").path("Family").asText());
+        assertEquals("5.7", resources.path("Maria").path("Properties").path("EngineVersion").asText(),
+            "another engine's 5.7 is not MySQL");
+        assertEquals("14", resources.path("Postgres").path("Properties").path("EngineVersion").asText());
+        assertEquals(2, adaptations.size());
+        assertEquals("\"5.7\"", adaptations.get(0).original().toString(), "the original value is reported");
+    }
+
+    @Test
+    void keepsMySql57AndOtherVersionsWhenTheHostCanRunIt() throws Exception {
+        ObjectNode native57 = mysqlTemplate("5.7", "mysql5.7");
+        java.util.List<com.cloudforge.core.local.TemplateAdaptation> none = new java.util.ArrayList<>();
+        MiniStackTemplateAdapter.substituteMySql57(native57, none, false);
+        assertEquals("5.7", native57.path("Resources").path("Db").path("Properties").path("EngineVersion").asText());
+        assertEquals("mysql5.7", native57.path("Resources").path("Pg").path("Properties").path("Family").asText());
+        assertTrue(none.isEmpty());
+
+        ObjectNode eight = mysqlTemplate("8.4", "mysql8.4");
+        MiniStackTemplateAdapter.substituteMySql57(eight, none, true);
+        assertEquals("8.4", eight.path("Resources").path("Db").path("Properties").path("EngineVersion").asText());
+        assertEquals("mysql8.4", eight.path("Resources").path("Pg").path("Properties").path("Family").asText());
+        assertTrue(none.isEmpty());
+    }
+
+    @Test
+    void substitutesAPatchLevelMySql57Too() throws Exception {
+        ObjectNode template = mysqlTemplate("5.7.44", "mysql5.7");
+        MiniStackTemplateAdapter.substituteMySql57(template, new java.util.ArrayList<>(), true);
+        assertEquals("8.0", template.path("Resources").path("Db").path("Properties").path("EngineVersion").asText());
     }
 }
