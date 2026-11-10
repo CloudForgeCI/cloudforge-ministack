@@ -36,7 +36,7 @@
   </scm>
 
   <properties>
-    <aws.sdk.version>2.57.8</aws.sdk.version>
+    <aws.sdk.version>2.57.11</aws.sdk.version>
     <testcontainers.version>1.21.0</testcontainers.version>
   </properties>
 
