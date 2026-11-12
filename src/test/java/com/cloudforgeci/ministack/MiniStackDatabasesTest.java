@@ -261,4 +261,82 @@ class MiniStackDatabasesTest {
         assertTrue(value.matches("[A-Za-z0-9]+"));
         assertEquals(value, MiniStackDatabases.localPassword("secret:Key", 32));
     }
+
+    @Test
+    void networkHostTreatsAGreetingAsReadyAndAnImmediateCloseAsNot() throws Exception {
+        try (java.net.ServerSocket greeting = new java.net.ServerSocket(0);
+             java.net.ServerSocket silent = new java.net.ServerSocket(0)) {
+            Thread server = Thread.ofVirtual().start(() -> {
+                try (java.net.Socket client = greeting.accept()) {
+                    client.getOutputStream().write(new byte[] {0x4a, 0, 0, 0, 0x0a});
+                } catch (IOException ignored) {
+                    // the test only reads the first byte
+                }
+            });
+            Thread proxy = Thread.ofVirtual().start(() -> {
+                try (java.net.Socket client = silent.accept()) {
+                    // a published port with no database behind it: accepts, then closes
+                } catch (IOException ignored) {
+                    // closed by the test
+                }
+            });
+            java.time.Duration timeout = java.time.Duration.ofSeconds(3);
+            assertTrue(NetworkDatabaseHost.answers("mysql", "127.0.0.1", greeting.getLocalPort(), timeout));
+            assertFalse(NetworkDatabaseHost.answers("mysql", "127.0.0.1", silent.getLocalPort(), timeout));
+            server.join();
+            proxy.join();
+        }
+    }
+
+    @Test
+    void networkHostAnswersAPostgresSslRequestWithOneByte() throws Exception {
+        try (java.net.ServerSocket server = new java.net.ServerSocket(0)) {
+            byte[][] received = new byte[1][];
+            Thread thread = Thread.ofVirtual().start(() -> {
+                try (java.net.Socket client = server.accept()) {
+                    received[0] = client.getInputStream().readNBytes(8);
+                    client.getOutputStream().write('S');
+                } catch (IOException ignored) {
+                    // the test checks what was received
+                }
+            });
+            assertTrue(NetworkDatabaseHost.answers("postgres", "127.0.0.1", server.getLocalPort(),
+                java.time.Duration.ofSeconds(3)));
+            thread.join();
+            assertEquals(8, received[0].length);
+            assertEquals(0x04, received[0][4]);
+        }
+    }
+
+    @Test
+    void networkHostReportsAnUnreachablePortAsNotReady() throws Exception {
+        int closed;
+        try (java.net.ServerSocket probe = new java.net.ServerSocket(0)) {
+            closed = probe.getLocalPort();
+        }
+        assertFalse(NetworkDatabaseHost.answers("mysql", "127.0.0.1", closed, java.time.Duration.ofSeconds(1)));
+    }
+
+    @Test
+    void networkHostFallsBackToTheContainerHostAliasForALoopbackAddress() {
+        assertEquals(List.of("localhost", "host.docker.internal"), NetworkDatabaseHost.candidates("localhost"));
+        assertEquals(List.of("127.0.0.1", "host.docker.internal"), NetworkDatabaseHost.candidates("127.0.0.1"));
+        assertEquals(List.of("172.18.0.5"), NetworkDatabaseHost.candidates("172.18.0.5"));
+    }
+
+    @Test
+    void hostDetectionHonoursTheModeVariableThenDockerAvailability() {
+        assertTrue(DatabaseHost.detect(name -> "network", () -> true) instanceof NetworkDatabaseHost);
+        assertTrue(DatabaseHost.detect(name -> "docker", () -> false) instanceof DockerDatabaseHost);
+        assertTrue(DatabaseHost.detect(name -> null, () -> true) instanceof DockerDatabaseHost);
+        assertTrue(DatabaseHost.detect(name -> null, () -> false) instanceof NetworkDatabaseHost);
+        assertTrue(DatabaseHost.detect(name -> "unrecognised", () -> false) instanceof NetworkDatabaseHost);
+    }
+
+    @Test
+    void databaseIsReusedOnlyWhenRecordedAndRunning() {
+        assertTrue(MiniStackDatabaseProvisioner.reusable(true, true));
+        assertFalse(MiniStackDatabaseProvisioner.reusable(true, false));
+        assertFalse(MiniStackDatabaseProvisioner.reusable(false, true));
+    }
 }
